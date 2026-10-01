@@ -126,7 +126,47 @@ def generate_snapshot_harness(project_root: Path, snapshot: Path) -> dict[str, P
     """Generate a simulator entry from the current snapshot, never UIBuilder C."""
     root = ET.parse(snapshot).getroot()
     out = project_root / "simulator"; out.mkdir(parents=True, exist_ok=True)
-    supported = {"1", "2", "5", "8", "12", "28"}
+    # custom.c is normally compiled by AiBuilder beside its generated screen
+    # objects.  The standalone SDL harness has no such generated runtime, so
+    # provide the minimal generic screen-manager contract it references.
+    custom_source = project_root / "ui_builder" / "custom" / "custom.c"
+    custom_text = custom_source.read_text(encoding="utf-8") if custom_source.is_file() else ""
+    custom_header = custom_source.with_suffix('.h')
+    runtime_owns_scene = custom_header.is_file() and '#define UAGENT_RUNTIME_OWNS_SCENE 1' in custom_header.read_text(encoding='utf-8')
+    if runtime_owns_scene:
+        # The runtime compiler owns the full object tree. Replaying the
+        # legacy snapshot as well duplicates pages, controls and paint.
+        root = ET.Element('ailv-app')
+    screen_names = sorted(set(re.findall(r"\b(screen_[A-Za-z0-9_]+)_get\s*\(", custom_text)))
+    screen_declarations = "\n".join(f"typedef struct {{ lv_obj_t *obj; }} {name}_t;" for name in screen_names)
+    manager_fields = "\n".join(f"    {name}_t {name};" for name in screen_names)
+    accessors = "\n".join(
+        f"{name}_t *{name}_get(ui_manager_t *ui) {{ if(!ui->{name}.obj) ui->{name}.obj = lv_obj_create(NULL); return &ui->{name}; }}\n"
+        f"void {name}_create(ui_manager_t *ui) {{ (void){name}_get(ui); }}"
+        for name in screen_names
+    )
+    first_screen = screen_names[0] if screen_names else None
+    screen_header = project_root / "ui_builder" / "ui_objects.h"
+    screen_header.parent.mkdir(parents=True, exist_ok=True)
+    screen_header.write_text(
+        "#ifndef UAGENT_SIMULATOR_UI_OBJECTS_H\n#define UAGENT_SIMULATOR_UI_OBJECTS_H\n"
+        '#include "lvgl.h"\n#include "aic_ui.h"\n'
+        "#if defined(LVGL_VERSION_MAJOR) && LVGL_VERSION_MAJOR >= 9\n#define lv_img_class lv_image_class\n#endif\n" +
+        screen_declarations + "\n"
+        "typedef struct {\n" + manager_fields + "\n} ui_manager_t;\n"
+        "extern ui_manager_t ui_manager;\n"
+        "void ui_objects_bind_primary(lv_obj_t *screen);\n" +
+        "\n".join(f"{name}_t *{name}_get(ui_manager_t *ui);\nvoid {name}_create(ui_manager_t *ui);" for name in screen_names) +
+        "\n#endif\n", encoding="utf-8", newline="\n")
+    (out / "ui_objects.c").write_text(
+        '#include "ui_objects.h"\nui_manager_t ui_manager;\n'
+        "void ui_objects_bind_primary(lv_obj_t *screen) {\n" +
+        (f"    ui_manager.{first_screen}.obj = screen;\n" if first_screen else "    (void)screen;\n") +
+        "}\n" + accessors + "\n", encoding="utf-8", newline="\n")
+    (out / "custom_harness.c").write_text(
+        '#include "aic_ui.h"\n#include "../ui_builder/custom/custom.c"\n',
+        encoding="utf-8", newline="\n")
+    supported = {"1", "2", "5", "6", "8", "12", "28"}
     widgets: list[dict[str, Any]] = []
     # Snapshot harnesses must follow the exported canvas.  Prefer an explicit
     # Page/root size, then the largest root-like widget; only use the browser
@@ -178,13 +218,19 @@ def generate_snapshot_harness(project_root: Path, snapshot: Path) -> dict[str, P
 
     if canvas_candidates:
         canvas_w, canvas_h = max(canvas_candidates, key=lambda pair: pair[0] * pair[1])
+    projects = list(project_root.glob('*.aicpro'))
+    if projects:
+        resolution = ET.parse(projects[0]).getroot().find('resolution')
+        if resolution is not None:
+            canvas_w = int(resolution.findtext('width', str(canvas_w)))
+            canvas_h = int(resolution.findtext('height', str(canvas_h)))
     lines = ['#include "uagent_snapshot.h"', '#include "lvgl.h"', '#include "aic_ui.h"', '']
     lines += ['void uagent_snapshot_build(lv_obj_t * parent) {']
     variables: dict[str, str] = {}
     for i, widget in enumerate(widgets):
         typ, x, y, w, h = (widget[k] for k in ("type", "x", "y", "w", "h"))
         attr, styles = widget["attr"], widget["styles"]
-        ctor = {"1":"lv_label_create", "2":"lv_btn_create", "5":"lv_img_create", "8":"lv_slider_create", "12":"lv_arc_create", "28":"lv_obj_create"}[typ]
+        ctor = {"1":"lv_label_create", "2":"lv_btn_create", "5":"lv_img_create", "6":"lv_bar_create", "8":"lv_slider_create", "12":"lv_arc_create", "28":"lv_obj_create"}[typ]
         var = f"snapshot_{i}"
         parent_var = variables.get(widget["parent"], "parent")
         variables[widget["id"]] = var
@@ -203,6 +249,8 @@ def generate_snapshot_harness(project_root: Path, snapshot: Path) -> dict[str, P
         minimum, maximum, value = cint(attr.get("min-value", "0")), cint(attr.get("max-value", "100"), 100), cint(attr.get("value", "0"))
         if typ == "8":
             lines += [f"    lv_slider_set_range({var}, {minimum}, {maximum});", f"    lv_slider_set_value({var}, {value}, LV_ANIM_OFF);"]
+        if typ == "6":
+            lines += [f"    lv_bar_set_range({var}, {minimum}, {maximum});", f"    lv_bar_set_value({var}, {value}, LV_ANIM_OFF);"]
         if typ == "12":
             lines += [f"    lv_arc_set_range({var}, {minimum}, {maximum});", f"    lv_arc_set_value({var}, {value});",
                       f"    lv_arc_set_bg_angles({var}, {cint(attr.get('bg-angle-start', '135'), 135)}, {cint(attr.get('bg-angle-end', '405'), 405)});",
@@ -255,17 +303,42 @@ def generate_snapshot_harness(project_root: Path, snapshot: Path) -> dict[str, P
 #include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "lvgl/lvgl.h"
 #include LV_SDL_INCLUDE_PATH
 #include "uagent_snapshot.h"
+#include "ui_objects.h"
 #include "custom.h"
 #undef main
+static void uagent_test_pump(unsigned milliseconds) {{
+    unsigned start=SDL_GetTicks();
+    do {{lv_timer_handler();SDL_Delay(5);}} while(SDL_GetTicks()-start<milliseconds);
+}}
+static void uagent_test_pointer(int x,int y,int end_x,int end_y) {{
+    /* This harness creates exactly one SDL window. Inject into its event
+       queue so hit-testing, scrolling and slider dragging are exercised. */
+    SDL_Event event={{0}};event.type=SDL_MOUSEBUTTONDOWN;
+    event.button.windowID=SDL_GetWindowID(SDL_GetWindowFromID(1));
+    event.button.button=SDL_BUTTON_LEFT;event.button.x=x;event.button.y=y;
+    SDL_PushEvent(&event);uagent_test_pump(60);
+    for(int step=1;step<=8;step++) {{
+        event.type=SDL_MOUSEMOTION;event.motion.windowID=SDL_GetWindowID(SDL_GetWindowFromID(1));
+        event.motion.state=SDL_BUTTON_LMASK;event.motion.x=x+(end_x-x)*step/8;event.motion.y=y+(end_y-y)*step/8;
+        SDL_PushEvent(&event);uagent_test_pump(20);
+    }}
+    event.type=SDL_MOUSEBUTTONUP;event.button.windowID=SDL_GetWindowID(SDL_GetWindowFromID(1));
+    event.button.button=SDL_BUTTON_LEFT;event.button.x=end_x;event.button.y=end_y;
+    SDL_PushEvent(&event);uagent_test_pump(100);
+}}
 static int uagent_write_snapshot(lv_display_t * display) {{
     const char * path = getenv("UAGENT_SIMULATOR_CAPTURE");
     if(!path || !*path) return 0;
     lv_draw_buf_t * buf = lv_display_get_buf_active(display);
     if(!buf || !buf->data) {{ fprintf(stderr, "uagent snapshot: display buffer unavailable\\n"); return 0; }}
-    FILE * out = fopen(path, "wb");
+    char temporary[2048];snprintf(temporary,sizeof(temporary),"%s.tmp",path);
+    FILE * out = fopen(temporary, "wb");
     if(!out) {{ fprintf(stderr, "uagent snapshot: fopen failed for %s\\n", path); return 0; }}
     const uint32_t row = (uint32_t)buf->header.w * 4U;
     const uint32_t image_size = row * (uint32_t)buf->header.h;
@@ -283,6 +356,11 @@ static int uagent_write_snapshot(lv_display_t * display) {{
     for(uint32_t y = 0; y < (uint32_t)buf->header.h; y++)
         fwrite(buf->data + y * buf->header.stride, 1, row, out);
     fclose(out);
+#ifdef _WIN32
+    if(!MoveFileExA(temporary,path,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)) return 0;
+#else
+    if(rename(temporary,path)) return 0;
+#endif
     fprintf(stderr, "uagent snapshot: wrote %s (%ux%u)\\n", path, buf->header.w, buf->header.h);
     return 1;
 }}
@@ -296,7 +374,10 @@ int main(void) {{
     lv_display_set_default(display);
     lv_obj_t * screen = lv_obj_create(NULL);
     lv_scr_load(screen);
+    ui_objects_bind_primary(screen);
+#ifndef UAGENT_RUNTIME_OWNS_SCENE
     uagent_snapshot_build(screen);
+#endif
     /* Leave a tiny startup marker so capture failures distinguish an
        unentered event loop from a snapshot API failure. */
     const char * capture_path = getenv("UAGENT_SIMULATOR_CAPTURE");
@@ -306,6 +387,28 @@ int main(void) {{
         else fprintf(stderr, "uagent snapshot: startup fopen failed for %s\\n", capture_path);
     }}
     custom_init();
+#ifdef UAGENT_RUNTIME_OWNS_SCENE
+    const char * action_list = getenv("UAGENT_TEST_ACTIONS");
+    if(action_list && *action_list) {{
+        char * actions = strdup(action_list);
+        char * cursor = actions;
+        while(cursor && *cursor) {{
+            char * next = strchr(cursor,';'); if(next) *next++=0;
+            char * value = strchr(cursor,'|'); if(value) *value++=0;
+            lv_obj_update_layout(lv_screen_active());
+            if(!strcmp(cursor,"@click")||!strcmp(cursor,"@drag")) {{
+                int x=0,y=0,end_x=0,end_y=0;int count=value?sscanf(value,"%d,%d,%d,%d",&x,&y,&end_x,&end_y):0;
+                if(count==2) {{end_x=x;end_y=y;}}
+                if(count==2||count==4) uagent_test_pointer(x,y,end_x,end_y);
+                else fprintf(stderr,"invalid pointer action\\n");
+            }} else if(!uagent_runtime_action(cursor,value?atof(value):0)) fprintf(stderr,"unknown action: %s\\n",cursor);
+            lv_timer_handler(); cursor=next;
+        }}
+        free(actions);
+    }}
+    const char *state_file=getenv("UAGENT_TEST_STATE_FILE");
+    if(state_file && *state_file) uagent_runtime_dump(state_file);
+#endif
     if(capture_path && *capture_path) {{
         FILE * ready = fopen(capture_path, "wb");
         if(ready) {{ fputs("UAGENT_READY", ready); fclose(ready); }}
@@ -329,8 +432,8 @@ project(uagent_snapshot C)
 set(CMAKE_C_STANDARD 11)
 file(GLOB_RECURSE LVGL_SRC "lvgl/src/*.c")
 file(GLOB_RECURSE AIC_WIDGETS_SRC "aic_widgets/*.c")
-add_executable(main main.c uagent_snapshot.c ../ui_builder/custom/custom.c ${LVGL_SRC} ${AIC_WIDGETS_SRC})
-target_include_directories(main PRIVATE . lvgl aic_widgets ../ui_builder/custom)
+add_executable(main main.c ui_objects.c uagent_snapshot.c custom_harness.c ${LVGL_SRC} ${AIC_WIDGETS_SRC})
+target_include_directories(main PRIVATE . lvgl aic_widgets ../ui_builder ../ui_builder/custom)
 # LVGL stringizes LV_CONF_PATH itself. Passing an already quoted absolute path
 # makes GCC include a literal \"path\" token and fail with Invalid argument.
 target_compile_definitions(main PRIVATE LV_CONF_PATH=lv_conf_uagent.h LVGL_STORAGE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../resources/image/" LVGL_DIR="L:${CMAKE_CURRENT_SOURCE_DIR}/../resources/image/")

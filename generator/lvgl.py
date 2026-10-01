@@ -8,6 +8,7 @@ comments plus audit metadata for a later binding pass.
 from __future__ import annotations
 
 import json
+import base64
 import hashlib
 import math
 import re
@@ -18,6 +19,524 @@ from adapters.contracts import AdaptedWidget
 from core.model import Component, ReactProjectModel
 
 from .model import GeneratedUnit, GenerationBundle
+from core.reactive_contract import literal as reactive_literal, substitute as reactive_substitute
+
+
+def _runtime_expression(value: Any, contract: dict[str, Any], depth: int = 0) -> str:
+    if depth > 24 or not isinstance(value,list):
+        raise ValueError('Unsupported or recursive reactive expression')
+    kind = value[0]
+    if kind == 'literal':
+        return _c_string(value[1]) if isinstance(value[1],str) else ('1' if value[1] is True else '0' if value[1] in (False,None) else repr(value[1]))
+    if kind == 'event':
+        return 'value'
+    if kind == 'id':
+        if value[1] in contract.get('constants',{}):
+            return _runtime_expression(contract['constants'][value[1]],contract,depth+1)
+        if any(s['name']==value[1] for s in contract.get('states',[])):
+            return 'runtime_state_'+c_symbol(value[1])
+    if kind == 'member':
+        if value[1] == ['id','Math'] and reactive_literal(value[2]) == 'PI':
+            return '3.14159265358979323846'
+        if value[1][0] == 'id' and isinstance(reactive_literal(value[2]),str) and any(s['name']==value[1][1] for s in contract.get('states',[])):
+            return 'runtime_state_'+c_symbol(value[1][1])+'_'+c_symbol(reactive_literal(value[2]))
+    if kind == 'binary':
+        operator={'===':'==','!==':'!='}.get(value[1],value[1])
+        if operator not in {'+','-','*','/','%','>','<','>=','<=','==','!=','&&','||'}:
+            raise ValueError(f'Unsupported operator {operator}')
+        return f'({_runtime_expression(value[2],contract,depth+1)} {operator} {_runtime_expression(value[3],contract,depth+1)})'
+    if kind == 'unary' and value[1] in {'-','+','!'}:
+        return f'({value[1]}{_runtime_expression(value[2],contract,depth+1)})'
+    if kind == 'conditional':
+        return '('+_runtime_expression(value[1],contract,depth+1)+' ? '+_runtime_expression(value[2],contract,depth+1)+' : '+_runtime_expression(value[3],contract,depth+1)+')'
+    if kind == 'call':
+        callee,args=value[1],value[2]
+        if callee == ['id','Number']:
+            return _runtime_expression(args[0],contract,depth+1)
+        if callee[0] == 'member':
+            name=reactive_literal(callee[2])
+            if callee[1] == ['id','Math']:
+                if name == 'random': return 'runtime_random()'
+                functions={'min':'fmin','max':'fmax','floor':'floor','ceil':'ceil','round':'round','abs':'fabs'}
+                if name in functions:
+                    parts=[_runtime_expression(a,contract,depth+1) for a in args]
+                    if name in {'min','max'}:
+                        result=parts[0]
+                        for part in parts[1:]: result=f'{functions[name]}({result},{part})'
+                        return result
+                    return f'{functions[name]}('+','.join(parts)+')'
+            if callee[1] == ['new',['id','Date'],[]] and name in {'getHours','getMinutes','getSeconds'}:
+                return f'runtime_clock_part({["getHours","getMinutes","getSeconds"].index(name)})'
+        if callee[0]=='id' and callee[1] in contract.get('functions',{}):
+            function=contract['functions'][callee[1]]
+            env={p['name']:a for p,a in zip(function[1],args) if p['name']}
+            def returned(statements: list[Any], local: dict[str,Any]) -> Any:
+                for index, statement in enumerate(statements):
+                    if statement[0]=='variables':
+                        for name,expression in statement[1]: local[name]=reactive_substitute(expression,local)
+                    elif statement[0]=='return': return reactive_substitute(statement[1],local)
+                    elif statement[0]=='if':
+                        yes=statement[2][1] if statement[2][0]=='block' else [statement[2]]
+                        no=statement[3][1] if statement[3] and statement[3][0]=='block' else [statement[3]] if statement[3] else statements[index+1:]
+                        return ['conditional',reactive_substitute(statement[1],local),returned(yes,dict(local)),returned(no,dict(local))]
+                raise ValueError('Helper function has no supported return')
+            return _runtime_expression(returned(function[2],env),contract,depth+1)
+    raise ValueError('Unsupported reactive expression: '+json.dumps(value,ensure_ascii=False)[:160])
+
+
+def _runtime_text_format(expressions: list[Any], contract: dict[str,Any]) -> tuple[str,list[str]]:
+    fmt=''; arguments=[]
+    def add(value: Any) -> None:
+        nonlocal fmt
+        if not value: return
+        if value[0]=='literal':
+            fmt+=str(value[1]).replace('%','%%'); return
+        if value[0]=='template':
+            fmt+=value[1].replace('%','%%')
+            for part,tail in value[2]: add(part); fmt+=tail.replace('%','%%')
+            return
+        if value[0]=='call' and value[1][0]=='member':
+            method=reactive_literal(value[1][2]); target=value[1][1]
+            if method=='toFixed':
+                precision=reactive_literal(value[2][0]) if value[2] else 0
+                fmt+=f'%.{int(precision)}f';arguments.append('(double)'+_runtime_expression(target,contract));return
+            if method=='padStart' and target[0]=='call' and target[1]==['id','String'] and reactive_literal(value[2][1])=='0':
+                fmt+=f'%0{int(reactive_literal(value[2][0]))}d';arguments.append('(int)'+_runtime_expression(target[2][0],contract));return
+        if value[0]=='id' and any(s['name']==value[1] and isinstance(reactive_literal(s['initial']),str) for s in contract.get('states',[])):
+            fmt+='%s';arguments.append(_runtime_expression(value,contract));return
+        fmt+='%g';arguments.append('(double)'+_runtime_expression(value,contract))
+    for expression in expressions: add(expression)
+    return fmt,arguments
+
+
+def runtime_scene_bundle(model: ReactProjectModel, screen_tree: dict[str, Any]) -> GenerationBundle | None:
+    """Compile measured DOM paint into one editable, source-traceable LVGL tree.
+
+    The browser is a build-time layout/font oracle. Neither browser code nor
+    page screenshots are embedded in the generated runtime.
+    """
+    captures = (model.browser_evidence or {}).get('screens', [])
+    if not captures or not all((s.get('data', {}).get('runtime_scene') or {}).get('schema') == 'uagent.runtime-scene/v1' for s in captures):
+        return None
+    scenes = [s['data']['runtime_scene'] for s in captures]
+    contract = screen_tree.get('reactive_contract', {})
+    fonts: dict[str, Any] = {}
+    for scene in scenes:
+        fonts.update(scene.get('fonts', {}))
+    font_ids = {key: f'uagent_font_{i}' for i, key in enumerate(fonts)}
+    lines = ['#include "custom.h"', '#include <math.h>', '#include <stdlib.h>', '#include <string.h>', '#include <stdio.h>',
+             'typedef struct {const lv_font_t *font; const uint32_t *codes; const float *advance; unsigned count;} runtime_font_t;']
+    for key, font in fonts.items():
+        symbol = font_ids[key]
+        bitmap = bytearray()
+        glyphs = ['{0}']
+        codes = []
+        for glyph in font['glyphs']:
+            codes.append(int(glyph['code']))
+            glyphs.append('{.bitmap_index=%d,.adv_w=%d,.box_w=%d,.box_h=%d,.ofs_x=%d,.ofs_y=%d}' % (
+                len(bitmap), round(glyph['advance'] * 16), glyph['w'], glyph['h'], glyph['x'], glyph['y']))
+            # LVGL's fmt_txt decoder supports 1/2/4 bpp plain glyphs. Quantize
+            # the captured alpha mask to 4 bpp, preserving glyph advances.
+            alpha = base64.b64decode(glyph['bitmap'])
+            levels = [min(15, (value + 8) // 17) for value in alpha]
+            bitmap.extend((levels[i] << 4) | (levels[i+1] if i+1 < len(levels) else 0) for i in range(0,len(levels),2))
+        lines += [f'static const uint8_t {symbol}_bitmap[] = {{' + ','.join(map(str, bitmap or b'\0')) + '};',
+                  f'static const lv_font_fmt_txt_glyph_dsc_t {symbol}_glyphs[] = {{' + ','.join(glyphs) + '};',
+                  f'static const uint16_t {symbol}_unicode[] = {{' + ','.join(str(c - codes[0]) for c in codes) + '};',
+                  f'static const lv_font_fmt_txt_cmap_t {symbol}_cmap[] = {{{{.range_start={codes[0]},.range_length={codes[-1]-codes[0]+1},.glyph_id_start=1,.unicode_list={symbol}_unicode,.list_length={len(codes)},.type=LV_FONT_FMT_TXT_CMAP_SPARSE_TINY}}}};',
+                  f'static lv_font_fmt_txt_dsc_t {symbol}_dsc = {{.glyph_bitmap={symbol}_bitmap,.glyph_dsc={symbol}_glyphs,.cmaps={symbol}_cmap,.cmap_num=1,.bpp=4,.bitmap_format=0}};',
+                  f'static const lv_font_t {symbol} = {{.get_glyph_dsc=lv_font_get_glyph_dsc_fmt_txt,.get_glyph_bitmap=lv_font_get_bitmap_fmt_txt,.line_height={font["ascent"]+font["descent"]},.base_line={font["descent"]},.dsc=&{symbol}_dsc}};']
+        lines += [f'static const uint32_t {symbol}_codes[]={{'+','.join(map(str,codes))+'};',
+                  f'static const float {symbol}_advances[]={{'+','.join(f'{g["advance"]:.6f}f' for g in font['glyphs'])+'};',
+                  f'static const runtime_font_t {symbol}_info={{&{symbol},{symbol}_codes,{symbol}_advances,{len(codes)}}};']
+
+    def number(value: Any, default: float = 0) -> float:
+        try:
+            return float(re.match(r'[-+\d.eE]+', str(value)).group())
+        except (ValueError, AttributeError):
+            return default
+
+    def pixel(value: float) -> int:
+        return math.floor(value + .5)
+
+    def rgba(value: Any) -> tuple[str, int]:
+        value = str(value or '')
+        values = re.findall(r'[\d.]+', value)
+        if value.startswith('rgb') and len(values) >= 3:
+            rgb = [max(0, min(255, round(float(v)))) for v in values[:3]]
+            return '0x%02x%02x%02x' % tuple(rgb), round(float(values[3]) * 255) if len(values) > 3 else 255
+        if re.fullmatch(r'#[0-9a-fA-F]{6}', value):
+            return '0x' + value[1:], 255
+        return '0x000000', 0
+
+    lines += [f'static lv_obj_t * runtime_pages[{len(scenes)}];',
+              'static void runtime_nav(lv_event_t *e) { if(lv_event_get_code(e)==LV_EVENT_CLICKED) lv_screen_load(runtime_pages[(intptr_t)lv_event_get_user_data(e)]); }',
+              'static lv_obj_t * runtime_box(lv_obj_t *parent,int x,int y,int w,int h) { lv_obj_t *o=lv_obj_create(parent); lv_obj_remove_style_all(o); lv_obj_set_pos(o,x,y); lv_obj_set_size(o,w,h); lv_obj_clear_flag(o,LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_CLICKABLE); return o; }']
+    lines += [r'''
+typedef struct {const runtime_font_t *font; float spacing, origin, initial_width, align; uint32_t color;} runtime_text_info_t;
+static void runtime_text_delete(lv_event_t *e) { free(lv_obj_get_user_data(lv_event_get_target_obj(e))); }
+static float runtime_text_width(const runtime_text_info_t *info,const char *text) {
+    float width=0;
+    for(const unsigned char *p=(const unsigned char*)text;*p;) {
+        int count=(*p<128)?1:((*p&224)==192)?2:((*p&240)==224)?3:4;uint32_t code=*p&((count==1)?127:(1<<(7-count))-1);
+        for(int i=1;i<count;i++)code=(code<<6)|(p[i]&63);p+=count;
+        for(unsigned i=0;i<info->font->count;i++)if(info->font->codes[i]==code){width+=info->font->advance[i]+info->spacing;break;}
+    }return width;
+}
+static void runtime_text_set(lv_obj_t *o,const char *text) {
+    runtime_text_info_t *info=lv_obj_get_user_data(o); lv_obj_clean(o); float x=info->origin-(runtime_text_width(info,text)-info->initial_width)*info->align;
+    for(const unsigned char *p=(const unsigned char*)text;*p;) {
+        int count=(*p<128)?1:((*p&224)==192)?2:((*p&240)==224)?3:4; uint32_t code=*p & ((count==1)?127:(1<<(7-count))-1);
+        for(int i=1;i<count;i++) code=(code<<6)|(p[i]&63);
+        char value[5]={0}; memcpy(value,p,count); p+=count;
+        lv_obj_t *glyph=lv_label_create(o);lv_obj_remove_style_all(glyph);lv_obj_set_style_text_font(glyph,info->font->font,0);
+        lv_label_set_text(glyph,value);lv_obj_set_pos(glyph,(int)floorf(x+.5f),0);lv_obj_set_style_text_color(glyph,lv_color_hex(info->color),0);
+        lv_obj_add_flag(glyph,LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+        float advance=0;for(unsigned i=0;i<info->font->count;i++)if(info->font->codes[i]==code){advance=info->font->advance[i];break;}
+        x+=advance+info->spacing;
+    }
+}
+static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime_font_t *font,uint32_t color,float spacing,float align,const char *text) {
+    int ix=(int)floorf(x);lv_obj_t *o=runtime_box(parent,ix,y,w,font->font->line_height);lv_obj_add_flag(o,LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    runtime_text_info_t *info=malloc(sizeof(*info));*info=(runtime_text_info_t){font,spacing,x-ix,0,align,color};info->initial_width=runtime_text_width(info,text);lv_obj_set_user_data(o,info);
+    lv_obj_add_event_cb(o,runtime_text_delete,LV_EVENT_DELETE,NULL);runtime_text_set(o,text);return o;
+}
+''']
+    units = []
+    blockers: list[str] = list(contract.get('blockers', []))
+    limitations: list[str] = []
+    controls = contract.get('controls', [])
+    control_ids = {c['identity']:i for i,c in enumerate(controls)}
+    control_kinds: dict[int,str] = {}
+    state_values = {s['name']:reactive_literal(s['initial']) for s in contract.get('states', [])}
+    state_variables: dict[tuple[str,str|None],str] = {}
+    for state, value in state_values.items():
+        fields = value.items() if isinstance(value,dict) else [(None,value)]
+        for field, initial in fields:
+            name='runtime_state_'+c_symbol(state)+('_'+c_symbol(field) if field else '')
+            state_variables[(state,field)] = name
+            if isinstance(initial,str): lines.append(f'static char {name}[128]={_c_string(initial)};')
+            elif isinstance(initial,(int,float,bool)): lines.append(f'static double {name}={int(initial) if isinstance(initial,bool) else repr(initial)};')
+            else: blockers.append(f'Unsupported initial state: {state}.{field}')
+    lines += ['#include <time.h>', 'static uint32_t runtime_seed=1;', 'static int64_t runtime_clock_ms;',
+              'static double runtime_random(void) { runtime_seed=runtime_seed*1664525u+1013904223u;return runtime_seed/4294967296.0; }',
+              'static int runtime_clock_part(int part) {time_t value=(time_t)(runtime_clock_ms/1000);struct tm *t=localtime(&value);return part==0?t->tm_hour:part==1?t->tm_min:t->tm_sec;}',
+              'static uint32_t runtime_css_color(const char *s) {return s&&s[0]==\'#\'?(uint32_t)strtoul(s+1,NULL,16):0;}',
+              'static void runtime_sync(void);', 'static void runtime_advance(int milliseconds);']
+    for i in range(len(controls)):
+        lines.append(f'static void runtime_control_{i}(lv_event_t *event);')
+    sync: list[str] = []
+    bound_controls: set[int] = set()
+    receipts = []
+    object_refs: list[tuple[str, str, str]] = []
+    routes = [str(s.get('state') or (s.get('path') or [''])[ -1]).casefold() for s in captures]
+    for screen_index, scene in enumerate(scenes):
+        nodes = {int(n['id']): n for n in scene['nodes']}
+        declarations = []
+        body = [f'static void runtime_build_{screen_index}(void) {{', f'    runtime_pages[{screen_index}]=runtime_box(NULL,0,0,{scene["viewport"]["width"]},{scene["viewport"]["height"]});']
+        rendered: dict[int, str] = {}
+        for node_id, node in nodes.items():
+            tag, rect, style, attrs = node['tag'], node['rect'], node['style'], node['attrs']
+            ref = f'runtime_{screen_index}_{node_id}'
+            reason = 'measured DOM node'
+            support = 'native'
+            if any(number(duration)>0 for duration in style.get('transitionDuration','0s').split(',')):
+                support,reason='partial','CSS transition endpoint is rendered; intermediate easing frames are not compiled'
+                limitations.append(f'{screen_index}:{node_id}: {reason}')
+            for effect in ('boxShadow','textShadow','filter','clipPath','maskImage','backgroundImage'):
+                if style.get(effect) not in (None,'','none'):
+                    support,reason='unsupported',f'{effect} has no runtime paint recipe'
+                    blockers.append(f'{screen_index}:{node_id}: {reason}')
+            if style['display'] == 'none' or style['visibility'] == 'hidden':
+                support, reason = 'native', 'source node retained; not painted in this state'
+            elif rect['width'] <= 0 or rect['height'] <= 0:
+                support, reason = 'partial', 'zero-size semantic node retained for event binding'
+            elif tag in {'defs', 'filter', 'fegaussianblur', 'femerge', 'femergenode', 'clippath'}:
+                support, reason = 'unsupported', 'SVG effect requires a classified paint recipe'
+                blockers.append(f'{screen_index}:{node_id}: {reason}')
+            else:
+                parent_id = node.get('parent')
+                while parent_id is not None and parent_id not in rendered:
+                    parent_id = nodes.get(parent_id, {}).get('parent')
+                parent = rendered.get(parent_id, f'runtime_pages[{screen_index}]')
+                parent_rect = nodes[parent_id]['rect'] if parent_id is not None else {'x': 0, 'y': 0}
+                x, y = pixel(rect['x']) - pixel(parent_rect['x']), pixel(rect['y']) - pixel(parent_rect['y'])
+                width, height = pixel(rect['x']+rect['width'])-pixel(rect['x']), pixel(rect['y']+rect['height'])-pixel(rect['y'])
+                declarations.append(f'static lv_obj_t * {ref};')
+                if tag == 'circle':
+                    stroke, opacity = rgba(style.get('stroke'))
+                    stroke_width = number(style.get('strokeWidth'), 1)
+                    radius = number(attrs.get('r'))
+                    cx, cy = number(attrs.get('cx')), number(attrs.get('cy'))
+                    rotation = re.search(r'rotate\(\s*([-+\d.]+)', attrs.get('transform', ''))
+                    angle = number(rotation.group(1)) if rotation else 0
+                    dash = [number(v) for v in re.findall(r'[-+\d.]+', style.get('strokeDasharray', ''))]
+                    offset = number(style.get('strokeDashoffset'))
+                    span = 360 * dash[0] / (2 * math.pi * radius) if dash and radius else 360
+                    start = (angle - offset / radius * 180 / math.pi) % 360 if radius else angle
+                    diameter = round(2 * radius + stroke_width)
+                    body += [f'    {ref}=lv_arc_create({parent}); lv_obj_remove_style_all({ref});',
+                             f'    lv_obj_set_pos({ref},{round(cx-radius-stroke_width/2)},{round(cy-radius-stroke_width/2)}); lv_obj_set_size({ref},{diameter},{diameter});',
+                             f'    lv_obj_clear_flag({ref},LV_OBJ_FLAG_CLICKABLE); lv_arc_set_bg_angles({ref},0,360);',
+                             f'    lv_arc_set_angles({ref},{round(start)},{round(start+span)}); lv_obj_set_style_arc_width({ref},{round(stroke_width)},LV_PART_INDICATOR);',
+                             f'    lv_obj_set_style_arc_color({ref},lv_color_hex({stroke}),LV_PART_INDICATOR); lv_obj_set_style_arc_opa({ref},{opacity},LV_PART_INDICATOR);',
+                             f'    lv_obj_set_style_arc_rounded({ref},{str(style.get("strokeLinecap")=="round").lower()},LV_PART_INDICATOR);']
+                elif tag in {'path', 'polygon', 'polyline', 'ellipse', 'canvas', 'img'}:
+                    support, reason = 'unsupported', f'{tag} paint has no runtime recipe'
+                    blockers.append(f'{screen_index}:{node_id}: {reason}')
+                    body.append(f'    {ref}=runtime_box({parent},{x},{y},{width},{height});')
+                else:
+                    body.append(f'    {ref}=runtime_box({parent},{x},{y},{width},{height});')
+                    color, opacity = rgba(style['backgroundColor'])
+                    body += [f'    lv_obj_set_style_bg_color({ref},lv_color_hex({color}),0); lv_obj_set_style_bg_opa({ref},{opacity},0);',
+                             f'    lv_obj_set_style_radius({ref},{round(number(style["borderRadius"]))},0);']
+                    for edge in ('Top','Right','Bottom','Left'):
+                        thick = round(number(style.get(f'border{edge}Width')))
+                        if not thick:
+                            continue
+                        color, alpha = rgba(style.get(f'border{edge}Color'))
+                        bx, by, bw, bh = {'Top':(0,0,width,thick),'Right':(width-thick,0,thick,height),'Bottom':(0,height-thick,width,thick),'Left':(0,0,thick,height)}[edge]
+                        body.append(f'    {{ lv_obj_t *b=runtime_box({ref},{bx},{by},{bw},{bh}); lv_obj_set_style_bg_color(b,lv_color_hex({color}),0); lv_obj_set_style_bg_opa(b,{alpha},0); }}')
+                rendered[node_id] = ref
+                if style['overflowX'] == 'visible' and style['overflowY'] == 'visible':
+                    body.append(f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_OVERFLOW_VISIBLE);')
+                if style['overflowY'] in {'auto', 'scroll'}:
+                    body += [f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_CLICKABLE); lv_obj_set_scroll_dir({ref},LV_DIR_VER); lv_obj_set_scrollbar_mode({ref},LV_SCROLLBAR_MODE_OFF);']
+                    object_refs.append((f'scroll:{screen_index}', ref, 'scroll'))
+                opacity = round(number(style.get('opacity'), 1) * 255)
+                if opacity < 255:
+                    body.append(f'    lv_obj_set_style_opa({ref},{opacity},0);')
+                for ti, text in enumerate(node.get('texts', [])):
+                    tr = text['rect']
+                    txt = text['text'].strip()
+                    if not txt or not node.get('font'):
+                        continue
+                    color, alpha = rgba(style.get('fill') if tag == 'text' else style['color'])
+                    text_ref = f'{ref}_text_{ti}'
+                    declarations.append(f'static lv_obj_t * {text_ref};')
+                    alignment=.5 if style.get('textAnchor')=='middle' or style.get('textAlign')=='center' else 1 if style.get('textAnchor')=='end' or style.get('textAlign')=='right' else 0
+                    body += [f'    {text_ref}=runtime_text({ref},{tr["x"]-pixel(rect["x"]):.6f}f,{math.ceil(tr["y"])-pixel(rect["y"])},{max(1,math.ceil(tr["width"]))},&{font_ids[node["font"]]}_info,{color},{number(style["letterSpacing"]):.6f}f,{alignment:.1f}f,{_c_string(txt)});',
+                             f'    lv_obj_set_style_opa({text_ref},{alpha},0);']
+                if tag == 'button':
+                    body.append(f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_CLICKABLE);')
+                    page = str(attrs.get('data-page', '')).casefold()
+                    key=attrs.get('aria-label') or ''.join(t['text'].strip() for t in node['texts'])
+                    if key in control_ids:
+                        ci=control_ids[key];bound_controls.add(ci);control_kinds[ci]='button'
+                        body.append(f'    lv_obj_add_event_cb({ref},runtime_control_{ci},LV_EVENT_CLICKED,NULL);')
+                    elif page in routes:
+                        body.append(f'    lv_obj_add_event_cb({ref},runtime_nav,LV_EVENT_CLICKED,(void*)(intptr_t){routes.index(page)});')
+                    object_refs.append((key, ref, 'button'))
+                if tag == 'input' and attrs.get('type') == 'range':
+                    native = node['native']
+                    declarations.append(f'static lv_obj_t * {ref}_slider;')
+                    body.append(f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_OVERFLOW_VISIBLE);')
+                    thumb=native.get('thumb',{});thumb_size=round(number(thumb.get('width'),max(2,height)))
+                    thumb_color,thumb_opa=rgba(thumb.get('background') or thumb.get('background-color'))
+                    if not thumb: blockers.append(f'{screen_index}:{node_id}: range thumb style unavailable')
+                    track_color,track_opa=rgba(style['backgroundColor']);track_offset=round((thumb_size-height)/2)
+                    body += [f'    lv_obj_set_size({ref},{width},{thumb_size});lv_obj_set_y({ref},{y-track_offset});lv_obj_set_style_bg_opa({ref},0,0);',
+                             f'    {{lv_obj_t *track=runtime_box({ref},0,{track_offset},{width},{height});lv_obj_set_style_bg_color(track,lv_color_hex({track_color}),0);lv_obj_set_style_bg_opa(track,{track_opa},0);lv_obj_set_style_radius(track,{height},0);}}',
+                             f'    {ref}_slider=lv_slider_create({ref}); lv_obj_remove_style_all({ref}_slider);',
+                             f'    lv_obj_set_size({ref}_slider,{max(1,width-thumb_size+1)},{thumb_size}); lv_obj_set_pos({ref}_slider,{thumb_size//2},0);',
+                             f'    lv_slider_set_range({ref}_slider,{round(number(native["min"]))},{round(number(native["max"],100))}); lv_slider_set_value({ref}_slider,{round(number(native["value"]))},LV_ANIM_OFF);',
+                             f'    lv_obj_set_style_bg_color({ref}_slider,lv_color_hex({thumb_color}),LV_PART_KNOB); lv_obj_set_style_bg_opa({ref}_slider,{thumb_opa},LV_PART_KNOB); lv_obj_set_style_radius({ref}_slider,LV_RADIUS_CIRCLE,LV_PART_KNOB); lv_obj_set_style_pad_all({ref}_slider,0,LV_PART_KNOB);',
+                             f'    lv_obj_add_flag({ref}_slider,LV_OBJ_FLAG_OVERFLOW_VISIBLE);lv_obj_set_ext_click_area({ref}_slider,{max(4,thumb_size)});']
+                    key=attrs.get('aria-label') or attrs.get('id') or f'node:{node_id}'
+                    object_refs.append((key, ref+'_slider', 'range'))
+                    if key in control_ids:
+                        ci=control_ids[key];bound_controls.add(ci);control_kinds[ci]='range'
+                        body.append(f'    lv_obj_add_event_cb({ref}_slider,runtime_control_{ci},LV_EVENT_VALUE_CHANGED,NULL);')
+                        actions=controls[ci]['actions']
+                        if len(actions)==1:
+                            action=actions[0];variable=state_variables.get((action['state'],action['field']))
+                            if variable:
+                                sync.append(f'    lv_slider_set_value({ref}_slider,(int){variable},LV_ANIM_OFF);')
+                                target=['member',['id',action['state']],['literal',action['field']]]
+                                def contains(expression:Any,wanted:Any) -> bool:
+                                    return expression==wanted or isinstance(expression,list) and any(contains(item,wanted) for item in expression)
+                                formats=[j['children'] for j in contract.get('jsx',[]) if j['tag']=='span' and contains(j['children'],target)]
+                                labels=[n for n in nodes.values() if n['parent']==node['parent'] and n['texts']]
+                                if len(formats)==1 and len(labels)==1:
+                                    fmt,args=_runtime_text_format(formats[0],contract)
+                                    label=f'runtime_{screen_index}_{labels[0]["id"]}_text_0'
+                                    sync.append(f'    {{char text[128];snprintf(text,sizeof(text),{_c_string(fmt)}'+(' ,'+','.join(args) if args else '')+f');runtime_text_set({label},text);}}')
+            if tag=='input' and attrs.get('type')=='checkbox':
+                key=attrs.get('id') or attrs.get('aria-label')
+                ci=control_ids.get(key)
+                parent_ref=rendered.get(node['parent'])
+                if ci is not None and parent_ref:
+                    bound_controls.add(ci);control_kinds[ci]='checkbox'
+                    body.append(f'    lv_obj_add_flag({parent_ref},LV_OBJ_FLAG_CLICKABLE);lv_obj_add_event_cb({parent_ref},runtime_control_{ci},LV_EVENT_CLICKED,NULL);')
+                    object_refs.append((key,parent_ref,'checkbox'))
+                    action=controls[ci]['actions'][0] if controls[ci]['actions'] else None
+                    variable=state_variables.get((action['state'],action['field'])) if action else None
+                    if variable:
+                        for checked,paints in node['native'].get('paintStates',{}).items():
+                            sync.append(f'    if({"" if checked=="true" else "!"}{variable}) {{')
+                            for paint in paints:
+                                child=nodes.get(paint['id']); child_ref=f'runtime_{screen_index}_{paint["id"]}'
+                                if not child: continue
+                                parent_rect=nodes[child['parent']]['rect'];r=paint['rect'];color,opa=rgba(paint['backgroundColor'])
+                                sync += [f'        lv_obj_set_pos({child_ref},{pixel(r["x"])-pixel(parent_rect["x"])},{pixel(r["y"])-pixel(parent_rect["y"])});',
+                                         f'        lv_obj_set_style_bg_color({child_ref},lv_color_hex({color}),0);lv_obj_set_style_bg_opa({child_ref},{opa},0);']
+                            sync.append('    }')
+                    support,reason='native','zero-size input bound to its measured, visible checkbox surface'
+            receipts.append({'screen':screen_index,'node':node_id,'parent':node.get('parent'),'tag':tag,'support':support,'reason':reason})
+            units.append(GeneratedUnit(source_id=f'browser:{screen_index}:{node_id}',symbol=ref,adapter='RuntimeSceneAdapter',widget_type=tag,support=support,c_code='',decisions={'reason':reason,'rect':rect,'parent':node.get('parent')}))
+        body.append('}')
+        lines += declarations + body
+        def descendants(parent_id:int) -> list[dict[str,Any]]:
+            result=[]
+            for item in nodes.values():
+                ancestor=item.get('parent')
+                while ancestor is not None:
+                    if ancestor==parent_id:
+                        result.append(item);break
+                    ancestor=nodes.get(ancestor,{}).get('parent')
+            return result
+        for view in contract.get('views',[]):
+            roots=[n for n in nodes.values() if n['attrs'].get('aria-label')==view['identity'] and n['attrs'].get('role')==view['role']]
+            for root_node in roots:
+                children=descendants(root_node['id']);ordinals={}
+                for source_child in view['children']:
+                    tag=source_child['tag'];ordinal=ordinals.get(tag,0);ordinals[tag]=ordinal+1
+                    matches=[n for n in children if n['tag']==tag]
+                    if ordinal>=len(matches): continue
+                    child=matches[ordinal];ref=f'runtime_{screen_index}_{child["id"]}'
+                    try:
+                        if tag=='circle':
+                            stroke=source_child['attrs'].get('stroke');offset=source_child['attrs'].get('strokeDashoffset')
+                            if stroke:
+                                sync.append(f'    lv_obj_set_style_arc_color({ref},lv_color_hex(runtime_css_color({_runtime_expression(stroke,contract)})),LV_PART_INDICATOR);')
+                            if offset:
+                                radius=number(child['attrs'].get('r'));rotation=re.search(r'rotate\(\s*([-+\d.]+)',child['attrs'].get('transform',''))
+                                angle=number(rotation.group(1)) if rotation else 0;dash=[number(v) for v in re.findall(r'[-+\d.]+',child['style'].get('strokeDasharray',''))]
+                                span=360*dash[0]/(2*math.pi*radius) if dash and radius else 360
+                                sync.append(f'    {{double start=fmod({angle}-({_runtime_expression(offset,contract)})/{radius}*180.0/3.141592653589793+720.0,360.0);lv_arc_set_angles({ref},(int)round(start),(int)round(start+{span}));}}')
+                        if child['texts'] and source_child['texts']:
+                            fmt,args=_runtime_text_format(source_child['texts'],contract)
+                            if args:
+                                sync.append(f'    {{char text[128];snprintf(text,sizeof(text),{_c_string(fmt)},'+','.join(args)+f');runtime_text_set({ref}_text_0,text);}}')
+                            fill=source_child['attrs'].get('fill')
+                            if fill and reactive_literal(fill) is None:
+                                sync.append(f'    {{uint32_t color=runtime_css_color({_runtime_expression(fill,contract)});((runtime_text_info_t*)lv_obj_get_user_data({ref}_text_0))->color=color;for(uint32_t i=0;i<lv_obj_get_child_count({ref}_text_0);i++)lv_obj_set_style_text_color(lv_obj_get_child({ref}_text_0,i),lv_color_hex(color),0);}}')
+                        css_class=source_child['attrs'].get('className')
+                        if css_class and css_class[0]=='conditional':
+                            for variant in css_class[2:]:
+                                name=reactive_literal(variant)
+                                if not name: continue
+                                animation=scene.get('animations',{}).get(name)
+                                if not animation: raise ValueError(f'Dynamic class {name} has no compiled style recipe')
+                                frames=animation.get('frames',[])
+                                if animation.get('easing')!='step-start' or animation.get('iterations')!='infinite' or len(frames)!=1 or frames[0].get('offset')!='50%' or frames[0].get('opacity')!='0':
+                                    raise ValueError(f'Unsupported CSS animation recipe: {name}')
+                                duration=animation['duration'];period=round(number(duration)*(1 if duration.endswith('ms') else 1000))
+                                if period<=0: raise ValueError('Invalid CSS animation duration')
+                                # CSS step-start jumps to the following keyframe at
+                                # each segment's start; the implicit endpoints are 1.
+                                sync.append(f'    {{static int active=0;static int64_t start=0;int enabled=!strcmp({_runtime_expression(css_class,contract)},{_c_string(name)});if(enabled&&!active)start=runtime_clock_ms;active=enabled;lv_obj_set_style_opa({ref},enabled&&((runtime_clock_ms-start)%{period}<{period//2})?0:255,0);}}')
+                    except ValueError as exc:
+                        blockers.append(f'{view["identity"]}: {exc}')
+    def assignments(actions:list[dict[str,Any]]) -> list[str]:
+        statements=[];commits=[]
+        for index,action in enumerate(actions):
+            variable=state_variables.get((action['state'],action['field']))
+            if not variable: raise ValueError(f'Unresolved state destination {action["state"]}.{action["field"]}')
+            initial=state_values[action['state']]
+            if action['field'] is not None: initial=initial[action['field']]
+            if isinstance(initial,str):
+                fmt,args=_runtime_text_format([action['value']],contract)
+                statements.append(f'    char next_{index}[128];snprintf(next_{index},sizeof(next_{index}),{_c_string(fmt)}'+(','+','.join(args) if args else '')+');')
+                commits.append(f'    snprintf({variable},sizeof({variable}),"%s",next_{index});')
+            else:
+                statements.append(f'    double next_{index}={_runtime_expression(action["value"],contract)};')
+                commits.append(f'    {variable}=next_{index};')
+        return statements+commits
+    for i,control in enumerate(controls):
+        lines.append(f'static void runtime_control_{i}(lv_event_t *event) {{')
+        kind=control_kinds.get(i)
+        if kind=='range': lines.append('    double value=lv_slider_get_value(lv_event_get_target_obj(event));')
+        elif kind=='checkbox' and control['actions']:
+            action=control['actions'][0];variable=state_variables.get((action['state'],action['field']),'0')
+            lines.append(f'    double value=!{variable};')
+        else: lines.append('    double value=0;(void)event;')
+        try:
+            if control.get('blocker'): raise ValueError(control['blocker'])
+            lines+=assignments(control['actions'])
+        except ValueError as exc: blockers.append(f'{control["identity"]}: {exc}')
+        lines+=['    runtime_sync();','}']
+        if i not in bound_controls: blockers.append(f'{control["identity"]}: source event has no runtime object')
+    timers=[];clock_states=[]
+    for index,timer in enumerate(contract.get('timers',[])):
+        try:
+            period=reactive_literal(timer['period'])
+            if not isinstance(period,(int,float)) or period<=0: raise ValueError('Unsupported timer period')
+            if timer.get('blocker'): raise ValueError(timer['blocker'])
+            statements=assignments(timer.get('actions',[]))
+            lines+=[f'static void runtime_tick_{index}(void) {{']+statements+['}']
+            lines.append(f'static int64_t runtime_due_{index};')
+            timers.append((index,int(period),bool(timer.get('immediate'))))
+            for action in timer.get('actions',[]):
+                if action['field'] is None and isinstance(state_values[action['state']],str):
+                    fmt,args=_runtime_text_format([action['value']],contract)
+                    if args and all('runtime_clock_part' in arg for arg in args): clock_states.append((action['state'],fmt))
+        except ValueError as exc: blockers.append(f'timer {index}: {exc}')
+    for screen_index,scene in enumerate(scenes):
+        for state,fmt in clock_states:
+            pattern=re.escape(fmt).replace('%02d',r'\d{2}')
+            matches=[(node,ti) for node in scene['nodes'] for ti,text in enumerate(node['texts']) if re.fullmatch(pattern,text['text'].strip())]
+            if len(matches)==1:
+                node,ti=matches[0];sync.append(f'    runtime_text_set(runtime_{screen_index}_{node["id"]}_text_{ti},{state_variables[(state,None)]});')
+            else: blockers.append(f'{screen_index}: clock text mapping is ambiguous')
+    for state,value in state_values.items():
+        if isinstance(value,str) and value.casefold() in routes:
+            for index,route in enumerate(routes):
+                sync.append(f'    if(!strcmp({state_variables[(state,None)]},{_c_string(route)}) && lv_screen_active()!=runtime_pages[{index}]) lv_screen_load(runtime_pages[{index}]);')
+    lines+=['static void runtime_sync(void) {']+sync+['}']
+    lines+=['static void runtime_advance(int milliseconds) {', '    int64_t end=runtime_clock_ms+milliseconds;', '    while(1) {int64_t next=end+1;']
+    for index,period,_ in timers: lines.append(f'        if(runtime_due_{index}<next)next=runtime_due_{index};')
+    lines+=['        if(next>end)break;runtime_clock_ms=next;']
+    for index,period,_ in timers: lines.append(f'        if(runtime_due_{index}<=next){{runtime_tick_{index}();runtime_due_{index}+={period};}}')
+    lines+=['    }runtime_clock_ms=end;runtime_sync();}', 'static void runtime_timer(lv_timer_t *timer) {(void)timer;runtime_advance(100);}']
+    lines+=['void uagent_runtime_dump(const char *path) {', '    FILE *file=fopen(path,"wb");if(!file)return;', '    fputs("{",file);']
+    first=True
+    for state,value in state_values.items():
+        prefix=('' if first else ',')+json.dumps(state)+':'
+        lines.append(f'    fputs({_c_string(prefix)},file);');first=False
+        fields=value.items() if isinstance(value,dict) else [(None,value)]
+        if isinstance(value,dict): lines.append('    fputs("{",file);')
+        for fi,(field,initial) in enumerate(fields):
+            if field is not None: lines.append(f'    fputs({_c_string(("," if fi else "")+json.dumps(field)+":")},file);')
+            variable=state_variables[(state,field)]
+            if isinstance(initial,str): lines.append(f'    fprintf(file,"\\\"%s\\\"",{variable});')
+            elif isinstance(initial,bool): lines.append(f'    fputs({variable}?"true":"false",file);')
+            else: lines.append(f'    fprintf(file,"%.12g",{variable});')
+        if isinstance(value,dict): lines.append('    fputs("}",file);')
+    lines+=['    fputs("}",file);fclose(file);','}']
+    # Public event entry lets the test runner exercise the same objects and
+    # event callbacks as SDL input, without automating the user's desktop.
+    lines += ['int uagent_runtime_action(const char *key,double value) {']
+    lines.append('    if(!strcmp(key,"@advance")){runtime_advance((int)value);return 1;}')
+    for key, ref, kind in object_refs:
+        if kind == 'range':
+            action=f'lv_slider_set_value({ref},(int)value,LV_ANIM_OFF);lv_obj_send_event({ref},LV_EVENT_VALUE_CHANGED,NULL);'
+        else:
+            action = f'lv_obj_scroll_to_y({ref},(int)value,LV_ANIM_OFF);' if kind == 'scroll' else f'lv_obj_send_event({ref},LV_EVENT_CLICKED,NULL);'
+        lines.append(f'    if(!strcmp(key,{_c_string(key)})) {{ {action} return 1; }}')
+    lines += ['    return 0;', '}', 'void custom_init(void) {']
+    lines+=['    const char *clock=getenv("UAGENT_TEST_CLOCK_MS");runtime_clock_ms=clock?strtoll(clock,NULL,10):(int64_t)time(NULL)*1000;',
+            '    if(!getenv("UAGENT_TEST_DETERMINISTIC"))runtime_seed=(uint32_t)time(NULL);']
+    for i in range(len(scenes)):
+        lines.append(f'    runtime_build_{i}();')
+    for index,period,immediate in timers:
+        lines.append(f'    runtime_due_{index}=runtime_clock_ms+{period};')
+        if immediate: lines.append(f'    runtime_tick_{index}();')
+    lines += ['    lv_screen_load(runtime_pages[0]);runtime_sync();', '    if(!getenv("UAGENT_TEST_DETERMINISTIC"))lv_timer_create(runtime_timer,100,NULL);', '}']
+    header = '#ifndef UAGENT_CUSTOM_H\n#define UAGENT_CUSTOM_H\n#include "lvgl.h"\n#define UAGENT_RUNTIME_OWNS_SCENE 1\nvoid custom_init(void);\nint uagent_runtime_action(const char*,double);\nvoid uagent_runtime_dump(const char*);\n#endif\n'
+    tree = dict(screen_tree)
+    tree['runtime_scene'] = {'schema':'uagent.runtime-scene/v1','nodes':receipts,'blockers':blockers,'limitations':limitations,'fonts':len(fonts),'source_controls':len(controls),'bound_controls':len(bound_controls),'timers':len(timers),'ownership':'custom.c owns every page; snapshot is not instantiated'}
+    return GenerationBundle(header,'\n'.join(lines)+'\n',units,[f'BLOCKER: {b}' for b in blockers]+[f'PARTIAL: {item}' for item in limitations],tree)
 
 
 def c_symbol(value: str) -> str:

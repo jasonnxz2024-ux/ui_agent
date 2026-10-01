@@ -10,8 +10,9 @@ from core.model import ReactProjectModel
 from core.capability import capability_plan_dict, plan_capabilities
 from core.browser_layout import browser_background_paint
 from core.planning_agent import run_planning_agent
+from core.reactive_contract import extract_reactive_contract, source_control_bindings, source_view_bindings, resolve_actions
 
-from .lvgl import LVGLRenderer, bundle, resource_filename
+from .lvgl import LVGLRenderer, bundle, resource_filename, runtime_scene_bundle
 from .model import GenerationBundle
 from .project import write_project_scaffold
 from .screen_ir import build_screen_ir, reachable_components
@@ -75,12 +76,36 @@ def compile_lvgl(model: ReactProjectModel) -> GenerationBundle:
             units.append(renderer.render(adapted, component, model))
         if not adapted_units and component.kind != "component":
             skipped.append(f"已识别但尚无生成适配器：{component.id} ({component.kind})")
-    output = bundle(units, build_screen_tree(model, reachable))
+    tree = build_screen_tree(model, reachable)
+    if any(s.get('data', {}).get('runtime_scene') for s in (model.browser_evidence or {}).get('screens', [])):
+        contract = extract_reactive_contract(model.source_dir, [model.components[c].source_file for c in reachable])
+        contract['controls'] = source_control_bindings(contract)
+        contract['views'] = source_view_bindings(contract)
+        for timer in contract.get('timers', []):
+            try:
+                timer['actions'] = resolve_actions(timer['callback'], contract)
+            except ValueError as exc:
+                timer['blocker'] = str(exc)
+        tree['reactive_contract'] = contract
+    output = runtime_scene_bundle(model, tree) or bundle(units, tree)
     if not units:
         output.warnings.append("没有可生成的 LVGL 组件；请检查语义扫描结果")
-    output.warnings.extend(skipped)
+    if not output.screen_tree.get('runtime_scene'):
+        output.warnings.extend(skipped)
     output.capability_plan = capability_plan_dict(model)
     output.agent_planning = dict(model.agent_planning)
+    runtime = output.screen_tree.get('runtime_scene')
+    if runtime:
+        output.agent_planning['summary'] = {**output.agent_planning.get('summary', {}), 'runtime_scene': {
+            'nodes': len(runtime['nodes']), 'source_controls': runtime['source_controls'],
+            'bound_controls': runtime['bound_controls'], 'timers': runtime['timers'],
+            'limitations': runtime.get('limitations', []),
+            'visual_validation': 'requires external browser/SDL comparison',
+        }}
+        output.agent_planning['blockers'] = [*output.agent_planning.get('blockers', []), *runtime['blockers']]
+        if runtime['blockers']:
+            output.agent_planning['status'] = 'blocked'
+        output.screen_tree['agent_planning'] = output.agent_planning
     output.warnings.extend(f"BLOCKER: {item}" for item in model.render_plan.blockers)
     if len(reachable) < len(model.components):
         output.warnings.append(

@@ -2530,6 +2530,21 @@ def _snapshot_screens(model: ReactProjectModel, width: int, height: int,
     return ''.join(screens)
 
 
+def _browser_evidence_for_scaffold(model: ReactProjectModel) -> dict[str, Any] | None:
+    """Reuse loaded evidence and avoid installing packages during export."""
+    cached = model.browser_evidence if isinstance(model.browser_evidence, dict) else None
+    if cached:
+        return cached
+    vite = model.source_dir / "node_modules" / ".bin" / ("vite.cmd" if os.name == "nt" else "vite")
+    if not vite.is_file() or os.environ.get("UAGENT_SKIP_BROWSER_CAPTURE") == "1":
+        return None
+    try:
+        return capture_layout(model.source_dir, viewport=(1024, 600))
+    except Exception as exc:
+        model.add_warning(f"Browser layout capture failed; using static fallback: {exc}")
+        return None
+
+
 def write_project_scaffold(project_root: Path, model: ReactProjectModel, include_runtime: bool = False) -> dict[str, Path]:
     """Write an openable UIBuilder project, not merely loose custom C files."""
     parser_profile = detect_parser(model.source_dir)
@@ -2563,29 +2578,7 @@ def write_project_scaffold(project_root: Path, model: ReactProjectModel, include
     # Browser evidence is best-effort: source-only fixtures still generate a
     # valid project, but are explicitly marked as static so coordinates are
     # never mistaken for measured browser geometry.
-    browser_layout = None
-    try:
-        if os.environ.get("UAGENT_SKIP_BROWSER_CAPTURE") == "1":
-            raise RuntimeError("browser capture skipped by regression mode")
-        # Capture at a desktop viewport so the centered Figma Make frame and
-        # its absolute origin are preserved; _browser_geometry normalizes it
-        # back to the LVGL canvas afterwards.
-        browser_layout = capture_layout(model.source_dir, viewport=(1024, 600))
-    except Exception as exc:
-        model.add_warning(f"Browser layout capture failed; using static fallback: {exc}")
-    if browser_layout is None:
-        # A previously verified capture is preferable to silently regenerating
-        # from static JSX when Chrome/Vite cannot be relaunched.
-        for evidence_file in (model.source_dir / "browser-layout-v2.json",
-                              model.source_dir / "browser-layout.json"):
-            if evidence_file.is_file():
-                try:
-                    cached = json.loads(evidence_file.read_text(encoding="utf-8"))
-                    if isinstance(cached, dict) and isinstance(cached.get("screens"), list):
-                        browser_layout = cached
-                        break
-                except (OSError, ValueError, TypeError):
-                    continue
+    browser_layout = _browser_evidence_for_scaffold(model)
     model.browser_evidence = browser_layout or {}
     plan_capabilities(model, browser_layout)
     layout_file = project_root / "openhmi" / "browser-layout.json"

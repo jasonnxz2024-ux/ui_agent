@@ -31,6 +31,83 @@ _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _PERSISTENT_RUNTIMES: dict[str, dict[str, Any]] = {}
 
 
+_DETERMINISTIC_BROWSER_SCRIPT = r"""(()=>{
+  let seed=1, clock=new Date(2026,9,1,12,34,56).getTime();const OriginalDate=Date,jobs=[];
+  Math.random=()=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;};
+  window.__uagentResetRandom=()=>{seed=1;};
+  window.Date=class extends OriginalDate {constructor(...args){super(...(args.length?args:[clock]));} static now(){return clock;}};
+  window.__uagentClock=clock;
+  window.setInterval=(fn,delay)=>{jobs.push({fn,delay,next:clock+delay});return jobs.length;};
+  window.clearInterval=id=>{if(jobs[id-1])jobs[id-1].fn=null;};
+  window.__uagentAdvance=ms=>{const end=clock+ms;while(true){const next=Math.min(...jobs.filter(j=>j.fn).map(j=>j.next));if(next>end)break;clock=next;for(const j of jobs)if(j.fn&&j.next<=clock){j.fn();j.next+=j.delay;}}clock=end;window.__uagentClock=clock;};
+})();"""
+
+
+_RUNTIME_SCENE_CAPTURE = r"""(() => {
+  const elements = [...document.querySelectorAll('body *')].filter(e => !['SCRIPT','STYLE','LINK'].includes(e.tagName));
+  const ids = new Map(elements.map((e, i) => [e, i]));
+  const fonts = {};
+  const chars = new Set([...Array(95)].map((_, i) => String.fromCharCode(i + 32)));
+  for (const e of elements) for (const c of e.textContent || '') chars.add(c);
+  const glyphFont = (s,e) => {
+    const size = parseFloat(s.fontSize), css = `${s.fontWeight} ${s.fontSize} ${s.fontFamily}`;
+    let background='rgb(255,255,255)';for(let p=e;p;p=p.parentElement){const c=getComputedStyle(p).backgroundColor;if(c!=='rgba(0, 0, 0, 0)'&&c!=='transparent'){background=c;break;}}
+    const foreground=e.tagName.toLowerCase()==='text'?s.fill:s.color,key=css+'|'+foreground+'|'+background;
+    if (fonts[key]) return key;
+    const canvas = document.createElement('canvas'); canvas.width = canvas.height = Math.max(96, Math.ceil(size * 4));
+    const ctx = canvas.getContext('2d', {willReadFrequently:true,alpha:false}); ctx.font = css;
+    const rgb=c=>{ctx.fillStyle=c;ctx.fillRect(0,0,1,1);return [...ctx.getImageData(0,0,1,1).data].slice(0,3);};
+    const bg=rgb(background),fg=rgb(foreground),weights=[.2126,.7152,.0722],contrast=fg.reduce((v,c,i)=>v+(c-bg[i])*weights[i],0);
+    const m = ctx.measureText('Mg'), ascent = Math.ceil(m.fontBoundingBoxAscent || size), descent = Math.ceil(m.fontBoundingBoxDescent || size * .25);
+    const glyphs = [], baseline = canvas.height - 16;
+    for (const c of [...chars].sort((a,b) => a.codePointAt(0)-b.codePointAt(0))) {
+      if (c.codePointAt(0) < 32) continue;
+      ctx.fillStyle=background;ctx.fillRect(0,0,canvas.width,canvas.height);ctx.fillStyle=foreground;ctx.fillText(c,16,baseline);
+      const pixels = ctx.getImageData(0,0,canvas.width,canvas.height).data;
+      const coverage=(x,y)=>Math.max(0,Math.min(255,Math.round(255*weights.reduce((v,w,i)=>v+(pixels[(y*canvas.width+x)*4+i]-bg[i])*w,0)/(contrast||1))));
+      let left=canvas.width, top=canvas.height, right=-1, bottom=-1;
+      for(let y=0;y<canvas.height;y++) for(let x=0;x<canvas.width;x++) if(coverage(x,y)) {left=Math.min(left,x);top=Math.min(top,y);right=Math.max(right,x);bottom=Math.max(bottom,y);}
+      let bytes=''; const w=Math.max(0,right-left+1), h=Math.max(0,bottom-top+1);
+      for(let y=top;y<=bottom;y++) for(let x=left;x<=right;x++) bytes+=String.fromCharCode(coverage(x,y));
+      glyphs.push({code:c.codePointAt(0),advance:ctx.measureText(c).width,w,h,x:w?left-16:0,y:h?baseline-bottom-1:0,bitmap:btoa(bytes)});
+    }
+    fonts[key]={css,size,ascent,descent,glyphs,raster:'opaque browser canvas luminance coverage',foreground,background}; return key;
+  };
+  const box = r => ({x:r.x,y:r.y,width:r.width,height:r.height});
+  const nodes = elements.map((e,i) => {
+    const s=getComputedStyle(e), r=e.getBoundingClientRect(), attrs=Object.fromEntries([...e.attributes].map(a=>[a.name,a.value]));
+    const textNodes=[...e.childNodes].filter(n=>n.nodeType===3 && n.textContent.trim());
+    const texts=textNodes.length?[(()=>{const range=document.createRange();range.setStartBefore(textNodes[0]);range.setEndAfter(textNodes[textNodes.length-1]);return {text:textNodes.map(n=>n.textContent).join(''),rect:box(range.getBoundingClientRect())};})()]:[];
+    const props=['display','visibility','opacity','position','color','backgroundColor','borderRadius','borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth','borderTopColor','borderRightColor','borderBottomColor','borderLeftColor','fontSize','fontWeight','fontFamily','lineHeight','letterSpacing','textAlign','textAnchor','overflowX','overflowY','fill','stroke','strokeWidth','strokeDasharray','strokeDashoffset','strokeLinecap','transform','zIndex'];
+    const style=Object.fromEntries(props.map(k=>[k,s[k]]));
+    for(const k of ['transitionProperty','transitionDuration','transitionTimingFunction','boxShadow','textShadow','filter','clipPath','maskImage','backgroundImage'])style[k]=s[k];
+    const native={value:e.value??null,checked:!!e.checked,min:e.min??null,max:e.max??null,step:e.step??null,disabled:!!e.disabled};
+    if(e.matches('input[type=range]')) {
+      const declarations={};
+      const scan=rules=>{for(const rule of rules||[]) {if(rule.cssRules) scan(rule.cssRules); if(rule.selectorText && rule.style) for(const selector of rule.selectorText.split(',')) {const suffix='::-webkit-slider-thumb'; if(selector.trim().endsWith(suffix)) {try {if(e.matches(selector.trim().slice(0,-suffix.length))) for(const p of rule.style) declarations[p]=rule.style.getPropertyValue(p);} catch {}}}}};
+      for(const sheet of document.styleSheets) {try {scan(sheet.cssRules);} catch {}}
+      native.thumb=declarations;
+    }
+    return {id:i,parent:ids.get(e.parentElement)??null,tag:e.tagName.toLowerCase(),attrs,rect:box(r),style,texts,font:texts.length?glyphFont(s,e):null,native,scroll:{x:e.scrollLeft,y:e.scrollTop,width:e.scrollWidth,height:e.scrollHeight,clientWidth:e.clientWidth,clientHeight:e.clientHeight}};
+  });
+  const freeze=document.createElement('style'); freeze.textContent='*{transition:none!important}';document.head.appendChild(freeze);
+  for(const e of elements.filter(e=>e.matches('input[type=checkbox]'))) {
+    const saved=e.checked, node=nodes[ids.get(e)]; node.native.paintStates={};
+    for(const checked of [false,true]) {
+      e.checked=checked;
+      node.native.paintStates[String(checked)]=[...e.parentElement.querySelectorAll('*')].filter(c=>c!==e).map(c=>({id:ids.get(c),rect:box(c.getBoundingClientRect()),backgroundColor:getComputedStyle(c).backgroundColor}));
+    }
+    e.checked=saved;
+  }
+  freeze.remove();
+  const animations={},keyframes={},animationRules=[];
+  const scanAnimations=rules=>{for(const rule of rules||[]){if(rule.type===CSSRule.KEYFRAMES_RULE){keyframes[rule.name]=[...rule.cssRules].map(k=>({offset:k.keyText,opacity:k.style.opacity}));}else{if(rule.style?.animationName&&rule.style.animationName!=='none')animationRules.push(rule);if(rule.cssRules)scanAnimations(rule.cssRules);}}};
+  for(const sheet of document.styleSheets){try{scanAnimations(sheet.cssRules);}catch{}}
+  for(const rule of animationRules)if(/^\.[\w-]+$/.test(rule.selectorText))animations[rule.selectorText.slice(1)]={duration:rule.style.animationDuration,easing:rule.style.animationTimingFunction,iterations:rule.style.animationIterationCount,frames:keyframes[rule.style.animationName]||[]};
+  return {schema:'uagent.runtime-scene/v1',viewport:{width:innerWidth,height:innerHeight},nodes,fonts,animations,testClock:window.__uagentClock??null};
+})()"""
+
+
 def close_browser_runtime(runtime_id: str | None) -> None:
     """Close one Browser/Vite runtime retained for a validation session."""
     runtime = _PERSISTENT_RUNTIMES.pop(str(runtime_id or ""), None)
@@ -508,6 +585,8 @@ def capture_layout(source_dir: Path, *, viewport: tuple[int, int] = (1024, 600),
             cdp.call("Emulation.setDeviceMetricsOverride", {"width": viewport[0], "height": viewport[1], "deviceScaleFactor": 1, "mobile": False})
             cdp.call("Page.enable")
             cdp.call("Runtime.enable")
+            if os.environ.get('UAGENT_TEST_DETERMINISTIC') == '1':
+                cdp.call('Page.addScriptToEvaluateOnNewDocument', {'source': _DETERMINISTIC_BROWSER_SCRIPT})
             nav_reply = cdp.call("Page.navigate", {"url": page_url})
             if nav_reply.get("error"):
                 try: (source_dir / ".uagent-browser-error.json").write_text(json.dumps({"stage":"page-navigate","reply":nav_reply}, ensure_ascii=False), encoding="utf-8")
@@ -554,6 +633,11 @@ def capture_layout(source_dir: Path, *, viewport: tuple[int, int] = (1024, 600),
                     explicit = attrs.get('data-openhmi-id') or attrs.get('data-figma-node-id') or attrs.get('id')
                     node['identity'] = explicit or f"dom:{node.get('index', 0)}"
                     node['identity_confidence'] = 1.0 if attrs.get('data-openhmi-id') else (0.95 if attrs.get('data-figma-node-id') else (0.85 if attrs.get('id') else 0.25))
+                # Preserve paint and control metadata omitted by the legacy
+                # semantic sampler, including zero-sized checkbox inputs.
+                runtime = evaluate_value(_RUNTIME_SCENE_CAPTURE)
+                if isinstance(runtime, dict):
+                    snapshot['runtime_scene'] = runtime
                 return snapshot
 
             control_expression = r"""(()=>Array.from(document.querySelectorAll('input[type=checkbox],[role=switch],button[aria-pressed]')).filter(e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'}).map((e,index)=>{const identity=e.getAttribute('data-openhmi-id')||e.getAttribute('data-figma-node-id')||e.id||null;return identity?{identity,kind:e.matches('input[type=checkbox]')?'checkbox':e.getAttribute('role')==='switch'?'switch':'button-pressed',index,checked:e.checked===true,ariaChecked:e.getAttribute('aria-checked'),ariaPressed:e.getAttribute('aria-pressed')}:null}).filter(Boolean))()"""

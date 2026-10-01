@@ -1,11 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Internal API-key-only desktop build."""
+"""Local-only desktop build with deterministic planning."""
 from PyInstaller.utils.hooks import collect_submodules
 
 
 hiddenimports = (['server.app'] + collect_submodules('uvicorn') + collect_submodules('webview') +
                  collect_submodules('fastapi') + collect_submodules('starlette') +
-                 collect_submodules('pydantic') + collect_submodules('httpx') +
+                 collect_submodules('pydantic') +
                  collect_submodules('anyio') + collect_submodules('server') +
                  collect_submodules('core') + collect_submodules('generator') +
                  collect_submodules('adapters'))
@@ -14,8 +14,7 @@ a = Analysis(
     ['D:/uagent/launcher.py'],
     pathex=['D:/uagent'],
     binaries=[],
-    datas=[('D:/uagent/frontend/dist', 'frontend/dist'),
-           ('D:/uagent/packaging/internal-byok.enabled', '.')],
+    datas=[('D:/uagent/frontend/dist', 'frontend/dist')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

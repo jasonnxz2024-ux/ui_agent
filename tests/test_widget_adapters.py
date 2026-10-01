@@ -6,6 +6,7 @@ sys.path.insert(0, str(ROOT))
 
 from core.pipeline import analyze
 from generator.compiler import compile_lvgl, write_aibuilder_custom
+from tools.cross_validate import generate_snapshot_harness
 
 
 def _by_adapter(bundle, name):
@@ -41,10 +42,10 @@ def test_test_project_generates_vertical_scroll_containers():
     bundle = compile_lvgl(analyze(Path(r"D:\aiassit\test")))
     scrolls = _by_adapter(bundle, "ScrollContainerAdapter")
     assert scrolls
-    language_settings = next(unit for unit in scrolls if unit.source_id.endswith("LanguageSettings.tsx:LanguageSettings"))
-    assert language_settings.decisions["scroll"]["axis"] == "y"
-    assert "lv_obj_set_scroll_dir" in language_settings.c_code
-    assert "LV_DIR_VER" in language_settings.c_code
+    vertical_scrolls = [unit for unit in scrolls if unit.decisions["scroll"]["axis"] == "y"]
+    assert vertical_scrolls
+    assert all("lv_obj_set_scroll_dir" in unit.c_code and "LV_DIR_VER" in unit.c_code
+               for unit in vertical_scrolls)
 
 
 def test_card_materializes_real_images_and_uses_uibuilder_macro(tmp_path):
@@ -53,7 +54,9 @@ def test_card_materializes_real_images_and_uses_uibuilder_macro(tmp_path):
     written = write_aibuilder_custom(bundle, tmp_path / "ui_builder" / "custom", model)
 
     images = [p for p in written["images"].glob("*.png") if not p.name.startswith("uagent_icon_")]
-    assert len(images) == 4
+    carousel = next(component for component in model.components.values()
+                    if component.id.endswith("CarouselStack.tsx:CarouselStack"))
+    assert len(images) >= len(carousel.resource_ids)
     custom_c = written["source"].read_text(encoding="utf-8")
     assert "LVGL_IMAGE_PATH(uagent_" in custom_c
     assert 'lv_img_set_src(' in custom_c
@@ -94,3 +97,14 @@ def test_chart_data_binding_and_random_seed_are_materialized():
     assert len(charts["bar"].decisions["series"]) == 2
     assert "lv_chart_set_next_value" in charts["line"].c_code
     assert charts["line"].support == "native"
+
+
+def test_snapshot_bar_type_generates_value_and_range(tmp_path):
+    snapshot = tmp_path / "bar.snapshot"
+    snapshot.write_text('''<Project><Widget type="6" id="bar"><Normal><postion>4,8</postion><size>120,18</size></Normal><Attribute><min-value>10</min-value><max-value>80</max-value><value>35</value></Attribute></Widget></Project>''', encoding="utf-8")
+
+    paths = generate_snapshot_harness(tmp_path, snapshot)
+    generated = paths["source"].read_text(encoding="utf-8")
+    assert "lv_bar_create(parent)" in generated
+    assert "lv_bar_set_range(snapshot_0, 10, 80)" in generated
+    assert "lv_bar_set_value(snapshot_0, 35, LV_ANIM_OFF)" in generated

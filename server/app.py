@@ -4,7 +4,6 @@ from uuid import uuid4
 import mimetypes
 import os
 import sys
-import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -61,43 +60,8 @@ class SourceRequest(BaseModel):
 def preflight_source(request: SourceRequest):
     """Report generation readiness without writing an output project."""
     report = inspect_source(request.source_dir)
-    settings = load_settings(SETTINGS_PATH)
-    browser_verified = False
-    source = Path(request.source_dir).resolve()
-    for evidence_file in (source / "browser-layout-v2.json", source / "browser-layout.json"):
-        if not evidence_file.is_file():
-            continue
-        try:
-            import json
-            cached = json.loads(evidence_file.read_text(encoding="utf-8"))
-            browser_verified = cached.get("status") == "browser-interaction"
-            if browser_verified:
-                break
-        except (OSError, ValueError, TypeError):
-            continue
-    capability_items = list(report.get("capability_candidates", []))
-    secure_model_route = ((settings.deployment == "station" and not _direct_provider_forbidden(settings.base_url)) or
-                          (settings.deployment == "internal_byok" and _internal_byok_enabled()))
-    if capability_items and secure_model_route:
-        try:
-            report["agent"] = analyze_capability_candidates(
-                settings, capability_items, SERVICE_ACCESS_TOKEN, browser_verified=browser_verified
-            )
-        except Exception as exc:
-            report["agent"] = {"status": "failed", "suggestions": [], "calls": 0,
-                                "error": str(exc)[:300]}
-    elif not secure_model_route:
-        report["agent"] = {"status": "station_required", "suggestions": [], "calls": 0}
-    else:
-        report["agent"] = {"status": "not_needed", "suggestions": [], "calls": 0}
-    navigation = report.get("navigation", {})
-    if secure_model_route and isinstance(navigation, dict) and navigation.get("needs_verification"):
-        try:
-            navigation["agent"] = analyze_navigation_candidates(
-                settings, navigation, list(navigation.get("component_candidates", [])), SERVICE_ACCESS_TOKEN
-            )
-        except Exception as exc:
-            navigation["agent"] = {"status": "failed", "suggestions": [], "error": str(exc)}
+    report["agent_planning"] = {"status": "local-only", "mode": "runtime-first-local", "calls": 0}
+    report["remote_model"] = {"status": "removed", "calls": 0}
     return report
 
 
@@ -124,57 +88,19 @@ def health():
 
 @app.get("/api/settings")
 def get_settings():
-    settings = load_settings(SETTINGS_PATH)
-    safe_station = settings.deployment == "station" and not _direct_provider_forbidden(settings.base_url)
-    safe_internal = settings.deployment == "internal_byok" and _internal_byok_enabled()
     return {
-        "enabled": settings.enabled,
-        "agent_enabled": settings.agent_is_enabled,
-        "agent_status": "enabled" if settings.agent_is_enabled else "disabled",
-        "base_url": settings.base_url if safe_station or safe_internal else "",
-        "model": settings.model if safe_station or safe_internal else "",
-        "provider": settings.provider,
-        "deployment": settings.deployment if safe_station or safe_internal else "station",
-        "api_only": _api_only_build(),
-        "allow_internal_byok": _internal_byok_enabled(),
-        "provider_presets": PROVIDER_PRESETS if _internal_byok_enabled() else {},
-        "station_token_configured": bool(SERVICE_ACCESS_TOKEN or (settings.api_key() if safe_station else None)),
-        "api_key_configured": bool(SERVICE_ACCESS_TOKEN) if safe_internal else False,
+        "enabled": False,
+        "agent_enabled": True,
+        "agent_status": "local deterministic planner",
+        "mode": "runtime-first-local",
+        "remote_models": False,
+        "api_keys": False,
     }
 
 
 @app.post("/api/settings")
 def update_settings(request: SettingsRequest):
-    global SERVICE_ACCESS_TOKEN
-    internal = request.deployment == "internal_byok"
-    if _api_only_build() and not internal:
-        raise HTTPException(400, "此内部构建只支持厂商 API Key 直连")
-    if internal and not _internal_byok_enabled():
-        raise HTTPException(403, "当前构建未启用内部 BYOK 模式")
-    if not internal and request.deployment != "station":
-        raise HTTPException(400, "未知模型部署模式")
-    if not internal and _direct_provider_forbidden(request.base_url):
-        raise HTTPException(400, "客户端禁止直连模型厂商；请填写 OpenHmi Station 地址")
-    if internal and request.provider not in PROVIDER_PRESETS:
-        raise HTTPException(400, "未知模型服务商")
-    settings = ModelSettings(enabled=request.enabled, base_url=request.base_url.strip(),
-                             model=request.model.strip(), agent_enabled=request.agent_enabled,
-                             provider=request.provider if internal else "station",
-                             deployment=request.deployment)
-    token = (request.api_key if internal else request.station_token) or SERVICE_ACCESS_TOKEN or settings.api_key()
-    available = list_available_models(settings, token)
-    strict_model_list = request.deployment == "station"
-    if not available.get("ok") or (strict_model_list and request.model not in available.get("models", [])):
-        raise HTTPException(400, {"message": "所选模型不在 Station 授权列表中", "models": available})
-    save_public_settings(settings, SETTINGS_PATH)
-    supplied = request.api_key if internal else request.station_token
-    if supplied:
-        SERVICE_ACCESS_TOKEN = supplied.strip()
-    return {"ok": True, "enabled": settings.enabled,
-            "agent_enabled": settings.agent_is_enabled,
-            "agent_status": "enabled" if settings.agent_is_enabled else "disabled",
-            "station_token_configured": bool(SERVICE_ACCESS_TOKEN or settings.api_key()) if not internal else False,
-            "api_key_configured": bool(SERVICE_ACCESS_TOKEN) if internal else False}
+    raise HTTPException(410, "Remote model settings were removed; local planning is always used.")
 
 
 class SettingsTestRequest(BaseModel):
@@ -189,23 +115,7 @@ class SettingsTestRequest(BaseModel):
 
 @app.post("/api/settings/test")
 def test_settings(request: SettingsTestRequest):
-    """Test Station auth, authorized model selection and image input."""
-    internal = request.deployment == "internal_byok"
-    if _api_only_build() and not internal:
-        raise HTTPException(400, "此内部构建只支持厂商 API Key 直连")
-    if internal and not _internal_byok_enabled():
-        raise HTTPException(403, "当前构建未启用内部 BYOK 模式")
-    if not internal and _direct_provider_forbidden(request.base_url):
-        raise HTTPException(400, "客户端禁止直连模型厂商；请填写 OpenHmi Station 地址")
-    settings = ModelSettings(enabled=True, base_url=request.base_url.strip(),
-                             model=request.model.strip(), agent_enabled=True,
-                             provider=request.provider if internal else "station", deployment=request.deployment)
-    token = (request.api_key if internal else request.station_token) or SERVICE_ACCESS_TOKEN
-    result = test_model_connection(settings, token,
-                                   require_vision=request.require_vision)
-    if not result.get("ok"):
-        raise HTTPException(400, result)
-    return result
+    raise HTTPException(410, "Remote model APIs were removed.")
 
 
 class ModelsRequest(BaseModel):
@@ -218,23 +128,7 @@ class ModelsRequest(BaseModel):
 
 @app.post("/api/settings/models")
 def available_models(request: ModelsRequest):
-    """Return only models authorized by Station for the current user."""
-    internal = request.deployment == "internal_byok"
-    if _api_only_build() and not internal:
-        raise HTTPException(400, "此内部构建只支持厂商 API Key 直连")
-    if internal and not _internal_byok_enabled():
-        raise HTTPException(403, "当前构建未启用内部 BYOK 模式")
-    if not internal and _direct_provider_forbidden(request.base_url):
-        raise HTTPException(400, "客户端禁止直连模型厂商；请填写 OpenHmi Station 地址")
-    provider = request.provider if internal else "station"
-    settings = ModelSettings(base_url=request.base_url.strip(), provider=provider,
-                             model=PROVIDER_PRESETS.get(provider, {}).get("model", ""),
-                             deployment=request.deployment)
-    token = (request.api_key if internal else request.station_token) or SERVICE_ACCESS_TOKEN
-    result = list_available_models(settings, token)
-    if not result.get("ok"):
-        raise HTTPException(400, result)
-    return result
+    raise HTTPException(410, "Remote model APIs were removed.")
 
 
 class VisualValidationRequest(BaseModel):
@@ -246,17 +140,7 @@ class VisualValidationRequest(BaseModel):
 
 @app.post("/api/validate/visual")
 def visual_validation(request: VisualValidationRequest):
-    """Run persistent Browser/SDL comparison with a fixed 90% gate."""
-    settings = load_settings(SETTINGS_PATH)
-    if not ((settings.deployment == "station" and not _direct_provider_forbidden(settings.base_url)) or
-            (settings.deployment == "internal_byok" and _internal_byok_enabled())):
-        raise HTTPException(409, "视觉增强验证仅允许通过 OpenHmi Station")
-    key = SERVICE_ACCESS_TOKEN or settings.api_key()
-    if not settings.enabled or not settings.agent_is_enabled or not key:
-        raise HTTPException(409, "视觉增强验证需要启用功能并配置 OpenHmi Station 会话")
-    connection = test_model_connection(settings, key, require_vision=True)
-    if not connection.get("ok"):
-        raise HTTPException(400, {"message": "模型连接测试失败", "connection": connection})
+    """Run the local deterministic Browser/SDL comparison without model APIs."""
     output = Path(request.output_dir).expanduser().resolve()
     simulator = request.simulator_exe
     if not simulator:
@@ -264,7 +148,6 @@ def visual_validation(request: VisualValidationRequest):
         simulator = str(candidate) if candidate.is_file() else None
     try:
         return cross_validate(request.source_dir, output, simulator_exe=simulator,
-                              settings=settings, api_key=key,
                               max_rounds=request.max_rounds, visible_browser=True,
                               confidence_threshold=.90)
     except (OSError, RuntimeError, ValueError) as exc:
@@ -384,7 +267,7 @@ async def video(file: UploadFile = File(...), task_id: str | None = Form(None)):
                              (settings.deployment == "internal_byok" and _internal_byok_enabled())):
         try:
             model_analysis = analyze_video_frames(settings, evidence.keyframes, SERVICE_ACCESS_TOKEN)
-        except (httpx.HTTPError, OSError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
             model_analysis = {"status": "error", "message": str(exc)}
     if task_id in TASKS:
         TASKS[task_id].video_evidence = {
