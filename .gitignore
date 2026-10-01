@@ -1,0 +1,37 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+.coverage
+htmlcov/
+# Dependencies, builds and conversion outputs
+node_modules/
+dist/
+build/
+workspaces/
+*.log
+# Local settings and credentials
+.env
+.env.*
+!.env.example
+uagent.settings.json
+project_history.csv
+*.pem
+*.key
+# Local design inputs and unrelated collections
+designs/
+figma_asset/
+Multi-functional Cluster (Community)/
+OpenHMI_Skills/
+.agents/
+.cursor/
+# Editor and OS files
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

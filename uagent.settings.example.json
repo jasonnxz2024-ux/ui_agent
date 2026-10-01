@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "base_url": "https://api.openai.com/v1",
+  "model": "gpt-5.6-terra",
+  "api_key_env": "UAGENT_API_KEY"
+}
