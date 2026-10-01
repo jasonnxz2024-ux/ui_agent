@@ -1,5 +1,7 @@
 # UAgent：React / Figma Make → LVGL / AiBuilder
 
+作者：**jason gao**
+
 UAgent 是用于嵌入式 HMI 开发的本地源码转换工作台：读取 React / Figma Make 工程，提取组件、资源和事件语义，通过适配器生成 LVGL C 代码及 AiBuilder / UIBuilder 工程，并记录转换结果与缺失项。
 
 当前目标是验证“源码 → 语义模型 → 控件适配 → 可审计的 custom.c / custom.h”转换链路。项目仍在开发中，生成文件不代表所有视觉效果和业务行为都已完整还原。
