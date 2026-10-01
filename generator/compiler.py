@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from shutil import copy2
 from pathlib import Path
 
@@ -16,6 +17,56 @@ from .lvgl import LVGLRenderer, bundle, resource_filename, runtime_scene_bundle
 from .model import GenerationBundle
 from .project import write_project_scaffold
 from .screen_ir import build_screen_ir, reachable_components
+
+
+def _merge_runtime_effect_decisions(planning: dict, runtime: dict, captures: list, contract: dict) -> None:
+    """Reconcile browser effects only with classified, source-bound paint nodes.
+
+    This adds instance evidence to the earlier source plan. It never clears
+    blockers merely because a renderer emitted C or a screenshot looks similar.
+    """
+    source_ids={f'{node["file"]}:{node["start"]}' for node in contract.get('jsx',[])}
+    receipts={(r['screen'],r['node']):r for r in runtime.get('nodes',[])}
+    decisions=[dict(d) for d in planning.get('decisions',[])]
+    resolved=[]
+    for decision in decisions:
+        props=decision.get('properties',{})
+        browser_origin=str(decision.get('node_id','')).startswith('browser:') or str(props.get('source_id','')).startswith(('browser:','dom:'))
+        if decision.get('kind')!='VisualEffect' or decision.get('support')!='unsupported' or not browser_origin:continue
+        index=props.get('screen_index');bounds=props.get('bounds')
+        if not isinstance(index,int) or not 0<=index<len(captures) or not bounds or len(bounds)!=4:continue
+        scene=captures[index].get('data',{}).get('runtime_scene',{})
+        candidates=[]
+        for node in scene.get('nodes',[]):
+            identity=node.get('attrs',{}).get('data-uagent-source')
+            receipt=receipts.get((index,node['id']))
+            if identity not in source_ids or not receipt or receipt['support'] in {'unsupported','fallback'}:continue
+            if any(str(b).startswith((f'{index}:{node["id"]}:',identity+':')) for b in runtime.get('blockers',[])):continue
+            rect=node['rect']
+            if any(abs(float(rect[k])-float(value))>.05 for k,value in zip(('x','y','width','height'),bounds)):continue
+            keys={'filter':['filter'],'gradient':['backgroundImage'],'shadow':['boxShadow','textShadow']}.get(props.get('kind'),[])
+            if props.get('value') not in [node['style'].get(key) for key in keys]:continue
+            candidates.append((node,receipt,identity))
+        if len(candidates)!=1:continue
+        node,receipt,identity=candidates[0]
+        partial=any(str(item).startswith(f'{index}:{node["id"]}:') for item in runtime.get('limitations',[]))
+        decision.update(support='partial' if partial else 'custom',source_id=identity,
+                        reason='Source-bound runtime paint recipe: '+receipt['reason'],blockers=[],
+                        evidence=[*decision.get('evidence',[]),'source:'+identity,f'runtime-scene:{index}:{node["id"]}'])
+        resolved.append(decision['node_id'])
+    if not resolved:return
+    counts={key:dict(value) for key,value in planning.get('counts',{}).items()}
+    planning['pre_runtime_counts']=planning.get('counts',{})
+    counts.setdefault('VisualEffect',{})['planned']=counts.get('VisualEffect',{}).get('planned',0)+len(resolved)
+    remaining={blocker for d in decisions for blocker in d.get('blockers',[])}
+    blocks=[]
+    for blocker in planning.get('blockers',[]):
+        if blocker=='Runtime capture contains a VisualEffect with no source-backed effect node.' and blocker not in remaining:continue
+        if blocker.startswith('Completeness blocker: VisualEffect ') and counts['VisualEffect']['planned']>=counts['VisualEffect'].get('browser',0):continue
+        blocks.append(blocker)
+    planning.update(decisions=decisions,counts=counts,blockers=blocks,status='blocked' if blocks else 'ready',runtime_effect_resolutions=resolved)
+    supports=Counter(d['support'] for d in decisions)
+    planning['summary']={**planning.get('summary',{}),**{key:supports[key] for key in ('native','custom','partial','fallback','unsupported')},'blocker_count':len(blocks)}
 
 
 def build_screen_tree(model: ReactProjectModel, reachable: list[str]) -> dict[str, object]:
@@ -96,6 +147,7 @@ def compile_lvgl(model: ReactProjectModel) -> GenerationBundle:
     output.agent_planning = dict(model.agent_planning)
     runtime = output.screen_tree.get('runtime_scene')
     if runtime:
+        _merge_runtime_effect_decisions(output.agent_planning,runtime,(model.browser_evidence or {}).get('screens',[]),tree.get('reactive_contract',{}))
         output.agent_planning['summary'] = {**output.agent_planning.get('summary', {}), 'runtime_scene': {
             'nodes': len(runtime['nodes']), 'source_controls': runtime['source_controls'],
             'bound_controls': runtime['bound_controls'], 'timers': runtime['timers'],

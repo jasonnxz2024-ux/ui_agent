@@ -22,6 +22,19 @@ from .model import GeneratedUnit, GenerationBundle
 from core.reactive_contract import literal as reactive_literal, substitute as reactive_substitute
 
 
+def _runtime_function_return(value: Any, contract: dict[str,Any]) -> Any:
+    if value[0]!='call' or value[1][0]!='id' or value[1][1] not in contract.get('functions',{}):
+        raise ValueError('Unsupported pure helper call')
+    function=contract['functions'][value[1][1]]
+    env={p['name']:a for p,a in zip(function[1],value[2]) if p['name']}
+    for statement in function[2]:
+        if statement[0]=='variables':
+            for name,expression in statement[1]:env[name]=reactive_substitute(expression,env)
+        elif statement[0]=='return':return reactive_substitute(statement[1],env)
+        else:raise ValueError('Pure geometry helper contains unsupported control flow')
+    raise ValueError('Pure helper has no return')
+
+
 def _runtime_expression(value: Any, contract: dict[str, Any], depth: int = 0) -> str:
     if depth > 24 or not isinstance(value,list):
         raise ValueError('Unsupported or recursive reactive expression')
@@ -30,18 +43,29 @@ def _runtime_expression(value: Any, contract: dict[str, Any], depth: int = 0) ->
         return _c_string(value[1]) if isinstance(value[1],str) else ('1' if value[1] is True else '0' if value[1] in (False,None) else repr(value[1]))
     if kind == 'event':
         return 'value'
+    if kind == 'state':
+        return 'runtime_state_'+c_symbol(value[1])
     if kind == 'id':
         if value[1] in contract.get('constants',{}):
             return _runtime_expression(contract['constants'][value[1]],contract,depth+1)
         if any(s['name']==value[1] for s in contract.get('states',[])):
             return 'runtime_state_'+c_symbol(value[1])
     if kind == 'member':
+        if value[1][0]=='array' and isinstance(reactive_literal(value[2]),int):
+            return _runtime_expression(value[1][1][reactive_literal(value[2])],contract,depth+1)
+        if value[1][0]=='call' and value[1][1][0]=='id' and value[1][1][1] in contract.get('functions',{}):
+            return _runtime_expression(['member',_runtime_function_return(value[1],contract),value[2]],contract,depth+1)
         if value[1] == ['id','Math'] and reactive_literal(value[2]) == 'PI':
             return '3.14159265358979323846'
         if value[1][0] == 'id' and isinstance(reactive_literal(value[2]),str) and any(s['name']==value[1][1] for s in contract.get('states',[])):
             return 'runtime_state_'+c_symbol(value[1][1])+'_'+c_symbol(reactive_literal(value[2]))
     if kind == 'binary':
         operator={'===':'==','!==':'!='}.get(value[1],value[1])
+        def string_operand(v):
+            return v[0]=='literal' and isinstance(v[1],str) or v[0]=='id' and any(s['name']==v[1] and isinstance(reactive_literal(s['initial']),str) for s in contract.get('states',[]))
+        if string_operand(value[2]) or string_operand(value[3]):
+            if operator not in {'==','!='} or not (string_operand(value[2]) and string_operand(value[3])):raise ValueError('Unsupported mixed string operator')
+            return f'(strcmp({_runtime_expression(value[2],contract,depth+1)},{_runtime_expression(value[3],contract,depth+1)}) {operator} 0)'
         if operator not in {'+','-','*','/','%','>','<','>=','<=','==','!=','&&','||'}:
             raise ValueError(f'Unsupported operator {operator}')
         return f'({_runtime_expression(value[2],contract,depth+1)} {operator} {_runtime_expression(value[3],contract,depth+1)})'
@@ -57,7 +81,8 @@ def _runtime_expression(value: Any, contract: dict[str, Any], depth: int = 0) ->
             name=reactive_literal(callee[2])
             if callee[1] == ['id','Math']:
                 if name == 'random': return 'runtime_random()'
-                functions={'min':'fmin','max':'fmax','floor':'floor','ceil':'ceil','round':'round','abs':'fabs'}
+                if name == 'round':return 'floor(('+_runtime_expression(args[0],contract,depth+1)+')+0.5)'
+                functions={'min':'fmin','max':'fmax','floor':'floor','ceil':'ceil','round':'round','abs':'fabs','sin':'sin','cos':'cos','sqrt':'sqrt','pow':'pow'}
                 if name in functions:
                     parts=[_runtime_expression(a,contract,depth+1) for a in args]
                     if name in {'min','max'}:
@@ -95,8 +120,17 @@ def _runtime_text_format(expressions: list[Any], contract: dict[str,Any]) -> tup
             fmt+=value[1].replace('%','%%')
             for part,tail in value[2]: add(part); fmt+=tail.replace('%','%%')
             return
+        if value[0]=='call' and value[1][0]=='id' and value[1][1] in contract.get('functions',{}):
+            add(_runtime_function_return(value,contract));return
         if value[0]=='call' and value[1][0]=='member':
             method=reactive_literal(value[1][2]); target=value[1][1]
+            if method=='toLocaleTimeString' and target==['new',['id','Date'],[]]:
+                options=reactive_literal(value[2][1]) if len(value[2])>1 else {}
+                if options.get('hour12') is not False or options.get('hour')!='2-digit' or options.get('minute')!='2-digit':
+                    raise ValueError('Only explicit 24-hour numeric locale time is supported')
+                fmt+='%02d:%02d';arguments.extend(['runtime_clock_part(0)','runtime_clock_part(1)'])
+                if options.get('second')=='2-digit':fmt+=':%02d';arguments.append('runtime_clock_part(2)')
+                return
             if method=='toFixed':
                 precision=reactive_literal(value[2][0]) if value[2] else 0
                 fmt+=f'%.{int(precision)}f';arguments.append('(double)'+_runtime_expression(target,contract));return
@@ -104,9 +138,50 @@ def _runtime_text_format(expressions: list[Any], contract: dict[str,Any]) -> tup
                 fmt+=f'%0{int(reactive_literal(value[2][0]))}d';arguments.append('(int)'+_runtime_expression(target[2][0],contract));return
         if value[0]=='id' and any(s['name']==value[1] and isinstance(reactive_literal(s['initial']),str) for s in contract.get('states',[])):
             fmt+='%s';arguments.append(_runtime_expression(value,contract));return
+        if value[0]=='conditional':
+            def string_value(v):
+                return v[0]=='literal' and isinstance(v[1],str) or v[0]=='id' and any(s['name']==v[1] and isinstance(reactive_literal(s['initial']),str) for s in contract.get('states',[])) or v[0]=='conditional' and string_value(v[2]) and string_value(v[3])
+            if string_value(value):fmt+='%s';arguments.append(_runtime_expression(value,contract));return
         fmt+='%g';arguments.append('(double)'+_runtime_expression(value,contract))
     for expression in expressions: add(expression)
     return fmt,arguments
+
+
+def _runtime_gradient(value: str) -> dict[str,Any] | None:
+    """Parse the bounded computed-CSS gradient grammar, without project rules."""
+    if not value.startswith(('radial-gradient(', 'linear-gradient(')) or value.count('gradient(')!=1:return None
+    colors=list(re.finditer(r'(rgba?\([\d.,\s]+\))(?:\s+([-+\d.]+)%)?',value))
+    if len(colors)<2:return None
+    heading=value[value.index('(')+1:colors[0].start()].strip(' ,')
+    radial=value.startswith('radial')
+    center=(.5,.5);axis=0
+    if radial:
+        match=re.fullmatch(r'(?:ellipse\s+)?at\s+([\d.]+)%\s+([\d.]+)%',heading)
+        if match:center=tuple(float(v)/100 for v in match.groups())
+        elif heading not in ('','ellipse'):return None
+    else:
+        axes={'':0,'to bottom':0,'to top':1,'to right':2,'to left':3}
+        if heading not in axes:return None
+        axis=axes[heading]
+    stops=[]
+    for i,color in enumerate(colors):
+        rgba=[float(v) for v in re.findall(r'[\d.]+',color[1])]
+        if len(rgba)==3:rgba.append(1)
+        position=float(color[2])/100 if color[2] is not None else 0 if i==0 else 1 if i==len(colors)-1 else None
+        stops.append({'position':position,'rgba':rgba})
+    for i,stop in enumerate(stops):
+        if stop['position'] is None:
+            left=i-1;right=next(j for j in range(i+1,len(stops)) if stops[j]['position'] is not None)
+            stop['position']=stops[left]['position']+(stops[right]['position']-stops[left]['position'])/(right-left)
+    if any(stops[i]['position']>stops[i+1]['position'] for i in range(len(stops)-1)):return None
+    return {'radial':radial,'center':center,'axis':axis,'stops':stops}
+
+
+def _runtime_shadows(value: str) -> list[dict[str,Any]] | None:
+    pattern=r'(rgba?\([^)]+\))\s+(-?[\d.]+)px\s+(-?[\d.]+)px\s+([\d.]+)px(?:\s+(-?[\d.]+)px)?(?:\s+(inset))?'
+    matches=list(re.finditer(pattern,value))
+    if not matches or re.sub(pattern,'',value).strip(' ,'):return None
+    return [{'color':m[1],'x':float(m[2]),'y':float(m[3]),'blur':float(m[4]),'spread':float(m[5] or 0),'inset':bool(m[6])} for m in matches]
 
 
 def runtime_scene_bundle(model: ReactProjectModel, screen_tree: dict[str, Any]) -> GenerationBundle | None:
@@ -173,8 +248,18 @@ def runtime_scene_bundle(model: ReactProjectModel, screen_tree: dict[str, Any]) 
               'static void runtime_nav(lv_event_t *e) { if(lv_event_get_code(e)==LV_EVENT_CLICKED) lv_screen_load(runtime_pages[(intptr_t)lv_event_get_user_data(e)]); }',
               'static lv_obj_t * runtime_box(lv_obj_t *parent,int x,int y,int w,int h) { lv_obj_t *o=lv_obj_create(parent); lv_obj_remove_style_all(o); lv_obj_set_pos(o,x,y); lv_obj_set_size(o,w,h); lv_obj_clear_flag(o,LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_CLICKABLE); return o; }']
     lines += [r'''
-typedef struct {const runtime_font_t *font; float spacing, origin, initial_width, align; uint32_t color;} runtime_text_info_t;
+typedef struct {const runtime_font_t *font; float spacing, origin, initial_width, align; uint32_t color;float sigma;uint32_t glow_color;int glow_opa;} runtime_text_info_t;
 static void runtime_text_delete(lv_event_t *e) { free(lv_obj_get_user_data(lv_event_get_target_obj(e))); }
+static lv_obj_t *runtime_blur(lv_obj_t *parent,const uint8_t *mask,int w,int h,float sigma,uint32_t color,int opacity,int x,int y) {
+    int radius=(int)ceilf(sigma*3);if(radius>48)radius=48;float kernel[97],sum=0;
+    for(int i=-radius;i<=radius;i++){kernel[i+radius]=expf(-i*i/(2*sigma*sigma));sum+=kernel[i+radius];}
+    for(int i=0;i<=radius*2;i++)kernel[i]/=sum;
+    float *temp=calloc((size_t)w*h,sizeof(float));uint32_t *pixels=calloc((size_t)w*h,4);
+    for(int yy=0;yy<h;yy++)for(int xx=0;xx<w;xx++){float value=0;for(int k=-radius;k<=radius;k++)if(xx+k>=0&&xx+k<w)value+=mask[yy*w+xx+k]*kernel[k+radius];temp[yy*w+xx]=value;}
+    for(int yy=0;yy<h;yy++)for(int xx=0;xx<w;xx++){float value=0;for(int k=-radius;k<=radius;k++)if(yy+k>=0&&yy+k<h)value+=temp[(yy+k)*w+xx]*kernel[k+radius];pixels[yy*w+xx]=((uint32_t)fminf(255,roundf(value*opacity/255))<<24)|color;}
+    free(temp);lv_obj_t *canvas=lv_canvas_create(parent);lv_obj_remove_style_all(canvas);lv_canvas_set_buffer(canvas,pixels,w,h,LV_COLOR_FORMAT_ARGB8888);lv_obj_set_pos(canvas,x,y);
+    lv_obj_set_user_data(canvas,pixels);lv_obj_add_event_cb(canvas,runtime_text_delete,LV_EVENT_DELETE,NULL);lv_obj_clear_flag(canvas,LV_OBJ_FLAG_CLICKABLE);return canvas;
+}
 static float runtime_text_width(const runtime_text_info_t *info,const char *text) {
     float width=0;
     for(const unsigned char *p=(const unsigned char*)text;*p;) {
@@ -184,7 +269,11 @@ static float runtime_text_width(const runtime_text_info_t *info,const char *text
     }return width;
 }
 static void runtime_text_set(lv_obj_t *o,const char *text) {
-    runtime_text_info_t *info=lv_obj_get_user_data(o); lv_obj_clean(o); float x=info->origin-(runtime_text_width(info,text)-info->initial_width)*info->align;
+    runtime_text_info_t *info=lv_obj_get_user_data(o); lv_obj_clean(o);
+    float width=runtime_text_width(info,text),origin=info->origin-(width-info->initial_width)*info->align;
+    int ix=(int)floorf(origin);lv_obj_set_x(o,ix);lv_obj_set_width(o,(int)ceilf(width+origin-ix)+2);float x=origin-ix;
+    int pad=(int)ceilf(info->sigma*3),left=(int)floorf(x)-pad,w=(int)ceilf(runtime_text_width(info,text))+2*pad+4,h=info->font->font->line_height+2*pad;
+    uint8_t *mask=info->sigma>0?calloc((size_t)w*h,1):NULL;
     for(const unsigned char *p=(const unsigned char*)text;*p;) {
         int count=(*p<128)?1:((*p&224)==192)?2:((*p&240)==224)?3:4; uint32_t code=*p & ((count==1)?127:(1<<(7-count))-1);
         for(int i=1;i<count;i++) code=(code<<6)|(p[i]&63);
@@ -192,14 +281,70 @@ static void runtime_text_set(lv_obj_t *o,const char *text) {
         lv_obj_t *glyph=lv_label_create(o);lv_obj_remove_style_all(glyph);lv_obj_set_style_text_font(glyph,info->font->font,0);
         lv_label_set_text(glyph,value);lv_obj_set_pos(glyph,(int)floorf(x+.5f),0);lv_obj_set_style_text_color(glyph,lv_color_hex(info->color),0);
         lv_obj_add_flag(glyph,LV_OBJ_FLAG_OVERFLOW_VISIBLE);
-        float advance=0;for(unsigned i=0;i<info->font->count;i++)if(info->font->codes[i]==code){advance=info->font->advance[i];break;}
+        float advance=0;for(unsigned i=0;i<info->font->count;i++)if(info->font->codes[i]==code){advance=info->font->advance[i];
+            if(mask){const lv_font_fmt_txt_dsc_t *d=info->font->font->dsc;const lv_font_fmt_txt_glyph_dsc_t *g=&d->glyph_dsc[i+1];
+                int gx=(int)floorf(x+.5f)+g->ofs_x-left,gy=info->font->font->line_height-info->font->font->base_line-g->ofs_y-g->box_h+pad;
+                for(int yy=0;yy<g->box_h;yy++)for(int xx=0;xx<g->box_w;xx++){int at=yy*g->box_w+xx,px=gx+xx,py=gy+yy;uint8_t a=(d->glyph_bitmap[g->bitmap_index+at/2]>>(at%2?0:4)&15)*17;if(px>=0&&px<w&&py>=0&&py<h&&mask[py*w+px]<a)mask[py*w+px]=a;}
+            }break;}
         x+=advance+info->spacing;
     }
+    if(mask){lv_obj_t *glow=runtime_blur(o,mask,w,h,info->sigma,info->glow_color,info->glow_opa,left,-pad);lv_obj_move_to_index(glow,0);free(mask);}
 }
 static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime_font_t *font,uint32_t color,float spacing,float align,const char *text) {
     int ix=(int)floorf(x);lv_obj_t *o=runtime_box(parent,ix,y,w,font->font->line_height);lv_obj_add_flag(o,LV_OBJ_FLAG_OVERFLOW_VISIBLE);
-    runtime_text_info_t *info=malloc(sizeof(*info));*info=(runtime_text_info_t){font,spacing,x-ix,0,align,color};info->initial_width=runtime_text_width(info,text);lv_obj_set_user_data(o,info);
+    runtime_text_info_t *info=malloc(sizeof(*info));*info=(runtime_text_info_t){font,spacing,x,0,align,color};info->initial_width=runtime_text_width(info,text);lv_obj_set_user_data(o,info);
     lv_obj_add_event_cb(o,runtime_text_delete,LV_EVENT_DELETE,NULL);runtime_text_set(o,text);return o;
+}
+typedef struct {float at,r,g,b,a;} runtime_stop_t;
+static void runtime_gradient(lv_obj_t *parent,int w,int h,int radial,float cx,float cy,int axis,const runtime_stop_t *stops,int count) {
+    uint32_t *pixels=malloc((size_t)w*h*4);if(!pixels)return;
+    for(int y=0;y<h;y++)for(int x=0;x<w;x++) {
+        float t;
+        if(radial){float dx=(x+.5f-w*cx)/fmaxf(1,w*fmaxf(cx,1-cx)),dy=(y+.5f-h*cy)/fmaxf(1,h*fmaxf(cy,1-cy));t=sqrtf((dx*dx+dy*dy)*.5f);}
+        else t=axis==0?(y+.5f)/h:axis==1?1-(y+.5f)/h:axis==2?(x+.5f)/w:1-(x+.5f)/w;
+        int i=0;while(i<count-2&&t>stops[i+1].at)i++;
+        const runtime_stop_t *a=&stops[i],*b=&stops[i+1];float f=fminf(1,fmaxf(0,(t-a->at)/fmaxf(.00001f,b->at-a->at)));
+        float alpha=a->a+(b->a-a->a)*f,den=fmaxf(alpha,.00001f);
+        int r=(int)roundf((a->r*a->a*(1-f)+b->r*b->a*f)/den),g=(int)roundf((a->g*a->a*(1-f)+b->g*b->a*f)/den),blue=(int)roundf((a->b*a->a*(1-f)+b->b*b->a*f)/den);
+        pixels[y*w+x]=((uint32_t)roundf(alpha*255)<<24)|((uint32_t)r<<16)|((uint32_t)g<<8)|(uint32_t)blue;
+    }
+    lv_obj_t *canvas=lv_canvas_create(parent);lv_obj_remove_style_all(canvas);lv_canvas_set_buffer(canvas,pixels,w,h,LV_COLOR_FORMAT_ARGB8888);
+    lv_obj_set_user_data(canvas,pixels);lv_obj_add_event_cb(canvas,runtime_text_delete,LV_EVENT_DELETE,NULL);lv_obj_clear_flag(canvas,LV_OBJ_FLAG_CLICKABLE);
+}
+typedef struct {lv_point_precise_t points[1025];int count;float sigma,width;uint32_t color;int opacity;lv_obj_t *glow;int positioned,base_x,base_y;} runtime_path_info_t;
+static void runtime_path_blur(lv_obj_t *o,runtime_path_info_t *info) {
+    if(info->sigma<=0)return;if(info->glow)lv_obj_delete(info->glow);
+    float minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9;
+    for(int i=0;i<info->count;i++){minx=fminf(minx,info->points[i].x);miny=fminf(miny,info->points[i].y);maxx=fmaxf(maxx,info->points[i].x);maxy=fmaxf(maxy,info->points[i].y);}
+    int pad=(int)ceilf(info->sigma*3+info->width*.5f+1),left=(int)floorf(minx)-pad,top=(int)floorf(miny)-pad,w=(int)ceilf(maxx)-left+pad+1,h=(int)ceilf(maxy)-top+pad+1;
+    uint8_t *mask=calloc((size_t)w*h,1);float half=info->width*.5f;
+    for(int i=1;i<info->count;i++){float ax=info->points[i-1].x-left,ay=info->points[i-1].y-top,bx=info->points[i].x-left,by=info->points[i].y-top,dx=bx-ax,dy=by-ay,length=dx*dx+dy*dy;
+        for(int yy=fmaxf(0,floorf(fminf(ay,by)-half-1));yy<h&&yy<=ceilf(fmaxf(ay,by)+half+1);yy++)for(int xx=fmaxf(0,floorf(fminf(ax,bx)-half-1));xx<w&&xx<=ceilf(fmaxf(ax,bx)+half+1);xx++){
+            float t=length>0?fminf(1,fmaxf(0,((xx-ax)*dx+(yy-ay)*dy)/length)):0,px=xx-ax-t*dx,py=yy-ay-t*dy;int a=(int)(255*fminf(1,fmaxf(0,half+.5f-sqrtf(px*px+py*py))));if(mask[yy*w+xx]<a)mask[yy*w+xx]=a;
+        }
+    }
+    info->glow=runtime_blur(o,mask,w,h,info->sigma,info->color,info->opacity,left,top);free(mask);
+}
+static runtime_path_info_t *runtime_path_info(lv_obj_t *o) {
+    runtime_path_info_t *info=lv_obj_get_user_data(o);if(!info){info=calloc(1,sizeof(*info));lv_obj_set_user_data(o,info);lv_obj_add_event_cb(o,runtime_text_delete,LV_EVENT_DELETE,NULL);}return info;
+}
+static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origin_y) {
+    double sx,sy,rx,ry,rotation,ex,ey;int large,sweep,consumed=0;
+    if(sscanf(d,"M%lf,%lf A%lf,%lf,%lf,%d,%d,%lf,%lf%n",&sx,&sy,&rx,&ry,&rotation,&large,&sweep,&ex,&ey,&consumed)!=9||d[consumed]||rx<=0||fabs(rx-ry)>.001||rotation!=0){fprintf(stderr,"unsupported reactive SVG arc: %s\n",d);return;}
+    runtime_path_info_t *info=runtime_path_info(o);lv_point_precise_t *points=info->points;
+    if(!info->positioned){lv_obj_update_layout(o);info->base_x=lv_obj_get_x(o)-(int)roundf(origin_x);info->base_y=lv_obj_get_y(o)-(int)roundf(origin_y);info->positioned=1;}
+    double xp=(sx-ex)*.5,yp=(sy-ey)*.5,dist=xp*xp+yp*yp;
+    if(dist<.000001)return;if(dist>rx*rx)rx=sqrt(dist);
+    double factor=(large==sweep?-1:1)*sqrt(fmax(0,(rx*rx-dist)/dist));
+    double cx=(sx+ex)*.5+factor*yp,cy=(sy+ey)*.5-factor*xp;
+    double start=atan2(sy-cy,sx-cx),delta=atan2(ey-cy,ex-cx)-start;
+    if(sweep&&delta<0)delta+=6.283185307179586;if(!sweep&&delta>0)delta-=6.283185307179586;
+    int count=(int)fmin(1024,fmax(2,ceil(fabs(delta)*rx/1.5)));
+    int minx=INT32_MAX,miny=INT32_MAX;
+    for(int i=0;i<=count;i++){double a=start+delta*i/count;points[i].x=round(cx+rx*cos(a));points[i].y=round(cy+rx*sin(a));if(points[i].x<minx)minx=points[i].x;if(points[i].y<miny)miny=points[i].y;}
+    for(int i=0;i<=count;i++){points[i].x-=minx;points[i].y-=miny;}
+    lv_obj_set_pos(o,info->base_x+minx,info->base_y+miny);
+    lv_line_set_points(o,points,count+1);info->count=count+1;runtime_path_blur(o,info);
 }
 ''']
     units = []
@@ -221,7 +366,7 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
     lines += ['#include <time.h>', 'static uint32_t runtime_seed=1;', 'static int64_t runtime_clock_ms;',
               'static double runtime_random(void) { runtime_seed=runtime_seed*1664525u+1013904223u;return runtime_seed/4294967296.0; }',
               'static int runtime_clock_part(int part) {time_t value=(time_t)(runtime_clock_ms/1000);struct tm *t=localtime(&value);return part==0?t->tm_hour:part==1?t->tm_min:t->tm_sec;}',
-              'static uint32_t runtime_css_color(const char *s) {return s&&s[0]==\'#\'?(uint32_t)strtoul(s+1,NULL,16):0;}',
+              'static uint32_t runtime_css_color(const char *s) {if(s&&s[0]==\'#\')return (uint32_t)strtoul(s+1,NULL,16);if(s&&strstr(s,"rgb"))s=strstr(s,"rgb");int r=0,g=0,b=0;if(s&&(sscanf(s,"rgba(%d,%d,%d",&r,&g,&b)==3||sscanf(s,"rgb(%d,%d,%d",&r,&g,&b)==3))return (r<<16)|(g<<8)|b;return 0;}',
               'static void runtime_sync(void);', 'static void runtime_advance(int milliseconds);']
     for i in range(len(controls)):
         lines.append(f'static void runtime_control_{i}(lv_event_t *event);')
@@ -240,16 +385,36 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
             ref = f'runtime_{screen_index}_{node_id}'
             reason = 'measured DOM node'
             support = 'native'
+            gradient=_runtime_gradient(style.get('backgroundImage','none'))
+            effect=node.get('effect') or {}
+            glow_sigma=effect.get('sigma',0) if effect.get('kind')=='gaussian-merge-glow' else 0
+            glow_supported=isinstance(glow_sigma,(int,float)) and 0<glow_sigma<=16 and tag in {'path','text'}
+            box_shadows=_runtime_shadows(style.get('boxShadow','none'))
+            text_shadows=_runtime_shadows(style.get('textShadow','none'))
+            text_shadow_supported=text_shadows and len(text_shadows)==1 and text_shadows[0]['x']==text_shadows[0]['y']==0 and 0<text_shadows[0]['blur']<=32
             if any(number(duration)>0 for duration in style.get('transitionDuration','0s').split(',')):
                 support,reason='partial','CSS transition endpoint is rendered; intermediate easing frames are not compiled'
                 limitations.append(f'{screen_index}:{node_id}: {reason}')
             for effect in ('boxShadow','textShadow','filter','clipPath','maskImage','backgroundImage'):
                 if style.get(effect) not in (None,'','none'):
+                    if effect=='backgroundImage' and gradient:
+                        support,reason='custom','computed CSS gradient rendered as a procedural LVGL canvas'
+                        continue
+                    if effect=='filter' and glow_supported:
+                        support,reason='custom','source-backed Gaussian blur + merge recipe'
+                        continue
+                    if effect=='boxShadow' and box_shadows:
+                        support,reason='partial','CSS box shadows mapped to LVGL shadow/border; blur rasterization can differ'
+                        limitations.append(f'{screen_index}:{node_id}: {reason}')
+                        continue
+                    if effect=='textShadow' and text_shadow_supported:
+                        support,reason='custom','CSS text shadow from source glyph mask and Gaussian blur'
+                        continue
                     support,reason='unsupported',f'{effect} has no runtime paint recipe'
                     blockers.append(f'{screen_index}:{node_id}: {reason}')
             if style['display'] == 'none' or style['visibility'] == 'hidden':
                 support, reason = 'native', 'source node retained; not painted in this state'
-            elif rect['width'] <= 0 or rect['height'] <= 0:
+            elif (rect['width'] <= 0 or rect['height'] <= 0) and not node.get('geometry',{}):
                 support, reason = 'partial', 'zero-size semantic node retained for event binding'
             elif tag in {'defs', 'filter', 'fegaussianblur', 'femerge', 'femergenode', 'clippath'}:
                 support, reason = 'unsupported', 'SVG effect requires a classified paint recipe'
@@ -260,10 +425,32 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
                     parent_id = nodes.get(parent_id, {}).get('parent')
                 parent = rendered.get(parent_id, f'runtime_pages[{screen_index}]')
                 parent_rect = nodes[parent_id]['rect'] if parent_id is not None else {'x': 0, 'y': 0}
+                if tag == 'text':
+                    # SVG text anchors belong to its coordinate space, not the
+                    # measured first string's bbox (which changes with state).
+                    rect = {**parent_rect, 'width': parent_rect.get('width', scene['viewport']['width']),
+                            'height': parent_rect.get('height', scene['viewport']['height'])}
                 x, y = pixel(rect['x']) - pixel(parent_rect['x']), pixel(rect['y']) - pixel(parent_rect['y'])
                 width, height = pixel(rect['x']+rect['width'])-pixel(rect['x']), pixel(rect['y']+rect['height'])-pixel(rect['y'])
                 declarations.append(f'static lv_obj_t * {ref};')
-                if tag == 'circle':
+                if tag in {'path','line','polyline','polygon','rect','ellipse'} and (node.get('geometry') or {}).get('points'):
+                    points=node['geometry']['points'];stroke,opacity=rgba(style.get('stroke'));fill,fill_alpha=rgba(style.get('fill'))
+                    declarations.append(f'static const lv_point_precise_t {ref}_points[]={{'+','.join('{%.5ff,%.5ff}'%tuple(p) for p in points)+'};')
+                    body += [f'    {ref}=lv_line_create({parent});lv_obj_remove_style_all({ref});lv_obj_set_pos({ref},{x},{y});',
+                             f'    lv_line_set_points({ref},{ref}_points,{len(points)});lv_obj_set_style_line_width({ref},{max(1,round(number(style.get("strokeWidth"),1)))},0);',
+                             f'    lv_obj_set_style_line_color({ref},lv_color_hex({stroke}),0);lv_obj_set_style_line_opa({ref},255,0);lv_obj_set_style_opa_layered({ref},{opacity},0);lv_obj_set_style_line_rounded({ref},{str(style.get("strokeLinecap")=="round").lower()},0);',
+                             f'    lv_obj_clear_flag({ref},LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);lv_obj_add_flag({ref},LV_OBJ_FLAG_OVERFLOW_VISIBLE);']
+                    if glow_supported:
+                        body.append(f'    {{runtime_path_info_t *p=runtime_path_info({ref});memcpy(p->points,{ref}_points,sizeof({ref}_points));p->count={len(points)};p->sigma={glow_sigma:.6f}f;p->width={number(style.get("strokeWidth"),1):.6f}f;p->color={stroke};p->opacity=255;runtime_path_blur({ref},p);}}')
+                    if fill_alpha and tag!='line':
+                        support,reason='unsupported','SVG filled geometry needs a fill recipe'
+                        blockers.append(f'{screen_index}:{node_id}: {reason}')
+                    elif support=='native':support,reason='custom','SVG stroke sampled from browser geometry; native LVGL polyline'
+                elif tag == 'circle' and rgba(style.get('fill'))[1] and not rgba(style.get('stroke'))[1]:
+                    fill,fill_alpha=rgba(style.get('fill'))
+                    body += [f'    {ref}=runtime_box({parent},{x},{y},{width},{height});lv_obj_set_style_radius({ref},LV_RADIUS_CIRCLE,0);',
+                             f'    lv_obj_set_style_bg_color({ref},lv_color_hex({fill}),0);lv_obj_set_style_bg_opa({ref},{fill_alpha},0);']
+                elif tag == 'circle':
                     stroke, opacity = rgba(style.get('stroke'))
                     stroke_width = number(style.get('strokeWidth'), 1)
                     radius = number(attrs.get('r'))
@@ -290,6 +477,16 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
                     color, opacity = rgba(style['backgroundColor'])
                     body += [f'    lv_obj_set_style_bg_color({ref},lv_color_hex({color}),0); lv_obj_set_style_bg_opa({ref},{opacity},0);',
                              f'    lv_obj_set_style_radius({ref},{round(number(style["borderRadius"]))},0);']
+                    if gradient:
+                        stops=','.join('{'+','.join(f'{v:.6f}f' for v in [s['position'],*s['rgba']])+'}' for s in gradient['stops'])
+                        body.append(f'    {{static const runtime_stop_t stops[]={{{stops}}};runtime_gradient({ref},{width},{height},{int(gradient["radial"])},{gradient["center"][0]:.6f}f,{gradient["center"][1]:.6f}f,{gradient["axis"]},stops,{len(gradient["stops"])});}}')
+                    for shadow in box_shadows or []:
+                        shadow_color,shadow_alpha=rgba(shadow['color'])
+                        if shadow['inset']:
+                            for bx,by,bw,bh in [(0,0,width,1),(0,height-1,width,1),(0,0,1,height),(width-1,0,1,height)]:
+                                body.append(f'    {{lv_obj_t *b=runtime_box({ref},{bx},{by},{bw},{bh});lv_obj_set_style_bg_color(b,lv_color_hex({shadow_color}),0);lv_obj_set_style_bg_opa(b,{shadow_alpha},0);}}')
+                        else:
+                            body.append(f'    lv_obj_set_style_shadow_width({ref},{round(shadow["blur"])},0);lv_obj_set_style_shadow_spread({ref},{round(shadow["spread"])},0);lv_obj_set_style_shadow_offset_x({ref},{round(shadow["x"])},0);lv_obj_set_style_shadow_offset_y({ref},{round(shadow["y"])},0);lv_obj_set_style_shadow_color({ref},lv_color_hex({shadow_color}),0);lv_obj_set_style_shadow_opa({ref},{shadow_alpha},0);')
                     for edge in ('Top','Right','Bottom','Left'):
                         thick = round(number(style.get(f'border{edge}Width')))
                         if not thick:
@@ -298,7 +495,7 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
                         bx, by, bw, bh = {'Top':(0,0,width,thick),'Right':(width-thick,0,thick,height),'Bottom':(0,height-thick,width,thick),'Left':(0,0,thick,height)}[edge]
                         body.append(f'    {{ lv_obj_t *b=runtime_box({ref},{bx},{by},{bw},{bh}); lv_obj_set_style_bg_color(b,lv_color_hex({color}),0); lv_obj_set_style_bg_opa(b,{alpha},0); }}')
                 rendered[node_id] = ref
-                if style['overflowX'] == 'visible' and style['overflowY'] == 'visible':
+                if style['overflowX'] == 'visible' and style['overflowY'] == 'visible' or tag in {'text','g','path','line','circle','rect','ellipse','polyline','polygon'}:
                     body.append(f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_OVERFLOW_VISIBLE);')
                 if style['overflowY'] in {'auto', 'scroll'}:
                     body += [f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_CLICKABLE); lv_obj_set_scroll_dir({ref},LV_DIR_VER); lv_obj_set_scrollbar_mode({ref},LV_SCROLLBAR_MODE_OFF);']
@@ -317,6 +514,10 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
                     alignment=.5 if style.get('textAnchor')=='middle' or style.get('textAlign')=='center' else 1 if style.get('textAnchor')=='end' or style.get('textAlign')=='right' else 0
                     body += [f'    {text_ref}=runtime_text({ref},{tr["x"]-pixel(rect["x"]):.6f}f,{math.ceil(tr["y"])-pixel(rect["y"])},{max(1,math.ceil(tr["width"]))},&{font_ids[node["font"]]}_info,{color},{number(style["letterSpacing"]):.6f}f,{alignment:.1f}f,{_c_string(txt)});',
                              f'    lv_obj_set_style_opa({text_ref},{alpha},0);']
+                    if glow_supported or text_shadow_supported:
+                        sigma=glow_sigma if glow_supported else text_shadows[0]['blur']/2
+                        shadow_color,shadow_alpha=(color,255) if glow_supported else rgba(text_shadows[0]['color'])
+                        body.append(f'    {{runtime_text_info_t *p=lv_obj_get_user_data({text_ref});p->sigma={sigma:.6f}f;p->glow_color={shadow_color};p->glow_opa={shadow_alpha};runtime_text_set({text_ref},{_c_string(txt)});}}')
                 if tag == 'button':
                     body.append(f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_CLICKABLE);')
                     page = str(attrs.get('data-page', '')).casefold()
@@ -384,6 +585,10 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
                     support,reason='native','zero-size input bound to its measured, visible checkbox surface'
             receipts.append({'screen':screen_index,'node':node_id,'parent':node.get('parent'),'tag':tag,'support':support,'reason':reason})
             units.append(GeneratedUnit(source_id=f'browser:{screen_index}:{node_id}',symbol=ref,adapter='RuntimeSceneAdapter',widget_type=tag,support=support,c_code='',decisions={'reason':reason,'rect':rect,'parent':node.get('parent')}))
+        for parent_id in nodes:
+            siblings=[n for n in nodes.values() if n.get('parent')==parent_id and n['id'] in rendered]
+            if any(n['style'].get('zIndex') not in (None,'auto','0') for n in siblings):
+                for item in sorted(siblings,key=lambda n:number(n['style'].get('zIndex'))):body.append(f'    lv_obj_move_to_index({rendered[item["id"]]},-1);')
         body.append('}')
         lines += declarations + body
         def descendants(parent_id:int) -> list[dict[str,Any]]:
@@ -396,15 +601,24 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
                     ancestor=nodes.get(ancestor,{}).get('parent')
             return result
         for view in contract.get('views',[]):
-            roots=[n for n in nodes.values() if n['attrs'].get('aria-label')==view['identity'] and n['attrs'].get('role')==view['role']]
+            if view.get('source_id'):
+                # Old receipts lack source instrumentation; retain legacy
+                # labelled bindings there, but never infer ordinal identities.
+                if not any(n['attrs'].get('data-uagent-source') for n in nodes.values()):continue
+                roots=[n for n in nodes.values() if n['attrs'].get('data-uagent-source')==view['source_id']]
+                if not roots: blockers.append(f'{view["identity"]}: dynamic source node not observed in browser evidence')
+            else:
+                roots=[n for n in nodes.values() if n['attrs'].get('aria-label')==view['identity'] and n['attrs'].get('role')==view['role']]
             for root_node in roots:
-                children=descendants(root_node['id']);ordinals={}
+                children=[root_node] if view.get('source_id') else descendants(root_node['id']);ordinals={}
                 for source_child in view['children']:
                     tag=source_child['tag'];ordinal=ordinals.get(tag,0);ordinals[tag]=ordinal+1
                     matches=[n for n in children if n['tag']==tag]
                     if ordinal>=len(matches): continue
                     child=matches[ordinal];ref=f'runtime_{screen_index}_{child["id"]}'
                     try:
+                        for guard in source_child.get('guards',[]):
+                            sync.append(f'    if({_runtime_expression(guard,contract)})lv_obj_remove_flag({ref},LV_OBJ_FLAG_HIDDEN);else lv_obj_add_flag({ref},LV_OBJ_FLAG_HIDDEN);')
                         if tag=='circle':
                             stroke=source_child['attrs'].get('stroke');offset=source_child['attrs'].get('strokeDashoffset')
                             if stroke:
@@ -415,18 +629,45 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
                                 span=360*dash[0]/(2*math.pi*radius) if dash and radius else 360
                                 sync.append(f'    {{double start=fmod({angle}-({_runtime_expression(offset,contract)})/{radius}*180.0/3.141592653589793+720.0,360.0);lv_arc_set_angles({ref},(int)round(start),(int)round(start+{span}));}}')
                         if child['texts'] and source_child['texts']:
+                            shadow_style=source_child['attrs'].get('style')
+                            if shadow_style and shadow_style[0]=='object':
+                                shadow_expr=next((v for k,v in shadow_style[1] if reactive_literal(k)=='textShadow'),None)
+                                if shadow_expr and reactive_literal(shadow_expr) is None:
+                                    sync.append(f'    ((runtime_text_info_t*)lv_obj_get_user_data({ref}_text_0))->glow_color=runtime_css_color({_runtime_expression(shadow_expr,contract)});')
                             fmt,args=_runtime_text_format(source_child['texts'],contract)
                             if args:
                                 sync.append(f'    {{char text[128];snprintf(text,sizeof(text),{_c_string(fmt)},'+','.join(args)+f');runtime_text_set({ref}_text_0,text);}}')
                             fill=source_child['attrs'].get('fill')
+                            inline_style=source_child['attrs'].get('style')
+                            if not fill and inline_style and inline_style[0]=='object':
+                                fill=next((v for k,v in inline_style[1] if reactive_literal(k)=='color'),None)
                             if fill and reactive_literal(fill) is None:
                                 sync.append(f'    {{uint32_t color=runtime_css_color({_runtime_expression(fill,contract)});((runtime_text_info_t*)lv_obj_get_user_data({ref}_text_0))->color=color;for(uint32_t i=0;i<lv_obj_get_child_count({ref}_text_0);i++)lv_obj_set_style_text_color(lv_obj_get_child({ref}_text_0,i),lv_color_hex(color),0);}}')
+                        if tag=='path' and source_child['attrs'].get('d') and reactive_literal(source_child['attrs']['d']) is None:
+                            fmt,args=_runtime_text_format([source_child['attrs']['d']],contract)
+                            skeleton=re.sub(r'%[-+.\d]*[fgds]','0',fmt)
+                            if not re.fullmatch(r'M[-+\d.,]+ A[-+\d.,]+',skeleton):raise ValueError('Reactive SVG path is not a single supported circular arc')
+                            ancestor=child
+                            while ancestor['tag']!='svg' and ancestor.get('parent') in nodes:ancestor=nodes[ancestor['parent']]
+                            ox=child['rect']['x']-ancestor['rect']['x'];oy=child['rect']['y']-ancestor['rect']['y']
+                            stroke=source_child['attrs'].get('stroke')
+                            if stroke and reactive_literal(stroke) is None:sync.append(f'    {{uint32_t color=runtime_css_color({_runtime_expression(stroke,contract)});lv_obj_set_style_line_color({ref},lv_color_hex(color),0);runtime_path_info({ref})->color=color;}}')
+                            sync.append(f'    {{char d[256];snprintf(d,sizeof(d),{_c_string(fmt)}'+(','+','.join(args) if args else '')+f');runtime_svg_arc({ref},d,{ox:.6f}f,{oy:.6f}f);}}')
                         css_class=source_child['attrs'].get('className')
                         if css_class and css_class[0]=='conditional':
+                            class_choices=[reactive_literal(v) for v in css_class[2:]]
+                            observed={n['attrs'].get('class','') for captured in scenes for n in captured['nodes'] if n['attrs'].get('data-uagent-source')==view.get('source_id')}
+                            route_states={name for name,value in state_values.items() if isinstance(value,str) and value.casefold() in routes}
+                            def referenced_states(v):
+                                if not isinstance(v,list):return set()
+                                if len(v)==2 and v[0]=='id' and v[1] in state_values:return {v[1]}
+                                return set().union(*(referenced_states(part) for part in v))
+                            page_variant=bool(view.get('source_id') and referenced_states(css_class) and referenced_states(css_class)<=route_states and all(c in observed for c in class_choices))
                             for variant in css_class[2:]:
                                 name=reactive_literal(variant)
                                 if not name: continue
                                 animation=scene.get('animations',{}).get(name)
+                                if not animation and page_variant:continue  # The captured page owns its source-backed class variant.
                                 if not animation: raise ValueError(f'Dynamic class {name} has no compiled style recipe')
                                 frames=animation.get('frames',[])
                                 if animation.get('easing')!='step-start' or animation.get('iterations')!='infinite' or len(frames)!=1 or frames[0].get('offset')!='50%' or frames[0].get('opacity')!='0':
@@ -498,7 +739,7 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
     for index,period,_ in timers: lines.append(f'        if(runtime_due_{index}<next)next=runtime_due_{index};')
     lines+=['        if(next>end)break;runtime_clock_ms=next;']
     for index,period,_ in timers: lines.append(f'        if(runtime_due_{index}<=next){{runtime_tick_{index}();runtime_due_{index}+={period};}}')
-    lines+=['    }runtime_clock_ms=end;runtime_sync();}', 'static void runtime_timer(lv_timer_t *timer) {(void)timer;runtime_advance(100);}']
+    lines+=['    }runtime_clock_ms=end;runtime_sync();}', 'static uint32_t runtime_last_tick;', 'static void runtime_timer(lv_timer_t *timer) {(void)timer;uint32_t now=lv_tick_get(),elapsed=now-runtime_last_tick;runtime_last_tick=now;runtime_advance((int)elapsed);}']
     lines+=['void uagent_runtime_dump(const char *path) {', '    FILE *file=fopen(path,"wb");if(!file)return;', '    fputs("{",file);']
     first=True
     for state,value in state_values.items():
@@ -532,7 +773,8 @@ static lv_obj_t *runtime_text(lv_obj_t *parent,float x,int y,int w,const runtime
     for index,period,immediate in timers:
         lines.append(f'    runtime_due_{index}=runtime_clock_ms+{period};')
         if immediate: lines.append(f'    runtime_tick_{index}();')
-    lines += ['    lv_screen_load(runtime_pages[0]);runtime_sync();', '    if(!getenv("UAGENT_TEST_DETERMINISTIC"))lv_timer_create(runtime_timer,100,NULL);', '}']
+    timer_resolution=min([100,*[period for _,period,_ in timers]])
+    lines += ['    lv_screen_load(runtime_pages[0]);runtime_sync();', f'    if(!getenv("UAGENT_TEST_DETERMINISTIC")){{runtime_last_tick=lv_tick_get();lv_timer_create(runtime_timer,{timer_resolution},NULL);}}', '}']
     header = '#ifndef UAGENT_CUSTOM_H\n#define UAGENT_CUSTOM_H\n#include "lvgl.h"\n#define UAGENT_RUNTIME_OWNS_SCENE 1\nvoid custom_init(void);\nint uagent_runtime_action(const char*,double);\nvoid uagent_runtime_dump(const char*);\n#endif\n'
     tree = dict(screen_tree)
     tree['runtime_scene'] = {'schema':'uagent.runtime-scene/v1','nodes':receipts,'blockers':blockers,'limitations':limitations,'fonts':len(fonts),'source_controls':len(controls),'bound_controls':len(bound_controls),'timers':len(timers),'ownership':'custom.c owns every page; snapshot is not instantiated'}

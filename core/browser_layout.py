@@ -82,13 +82,23 @@ _RUNTIME_SCENE_CAPTURE = r"""(() => {
     const style=Object.fromEntries(props.map(k=>[k,s[k]]));
     for(const k of ['transitionProperty','transitionDuration','transitionTimingFunction','boxShadow','textShadow','filter','clipPath','maskImage','backgroundImage'])style[k]=s[k];
     const native={value:e.value??null,checked:!!e.checked,min:e.min??null,max:e.max??null,step:e.step??null,disabled:!!e.disabled};
+    let geometry=null;
+    let effect=null;
+    const filterId=(attrs.filter||s.filter||'').match(/#([^"')]+)/)?.[1],filter=filterId&&document.getElementById(filterId);
+    if(filter){const primitives=[...filter.children].map(n=>n.localName.toLowerCase()),blur=filter.querySelector('feGaussianBlur'),merge=filter.querySelector('feMerge'),inputs=merge?[...merge.children].map(n=>n.getAttribute('in')):[];
+      effect=primitives.length===2&&primitives.includes('fegaussianblur')&&primitives.includes('femerge')&&inputs.length===2&&inputs[1]==='SourceGraphic'&&inputs[0]===blur?.getAttribute('result')&&[null,'SourceGraphic'].includes(blur?.getAttribute('in'))?{kind:'gaussian-merge-glow',sigma:Number(blur.getAttribute('stdDeviation'))}:{kind:'unsupported',primitives};}
+    if(typeof e.getTotalLength==='function'){
+      try{const length=e.getTotalLength(),matrix=e.getScreenCTM(),count=Math.max(1,Math.min(1024,Math.ceil(length/1.5)));
+        geometry={points:Array.from({length:count+1},(_,i)=>{const p=e.getPointAtLength(length*i/count),q=new DOMPoint(p.x,p.y).matrixTransform(matrix);return [q.x-r.x,q.y-r.y];}),length};
+      }catch(error){geometry={error:String(error)};}
+    }
     if(e.matches('input[type=range]')) {
       const declarations={};
       const scan=rules=>{for(const rule of rules||[]) {if(rule.cssRules) scan(rule.cssRules); if(rule.selectorText && rule.style) for(const selector of rule.selectorText.split(',')) {const suffix='::-webkit-slider-thumb'; if(selector.trim().endsWith(suffix)) {try {if(e.matches(selector.trim().slice(0,-suffix.length))) for(const p of rule.style) declarations[p]=rule.style.getPropertyValue(p);} catch {}}}}};
       for(const sheet of document.styleSheets) {try {scan(sheet.cssRules);} catch {}}
       native.thumb=declarations;
     }
-    return {id:i,parent:ids.get(e.parentElement)??null,tag:e.tagName.toLowerCase(),attrs,rect:box(r),style,texts,font:texts.length?glyphFont(s,e):null,native,scroll:{x:e.scrollLeft,y:e.scrollTop,width:e.scrollWidth,height:e.scrollHeight,clientWidth:e.clientWidth,clientHeight:e.clientHeight}};
+    return {id:i,parent:ids.get(e.parentElement)??null,tag:e.tagName.toLowerCase(),attrs,rect:box(r),style,texts,font:texts.length?glyphFont(s,e):null,native,geometry,effect,scroll:{x:e.scrollLeft,y:e.scrollTop,width:e.scrollWidth,height:e.scrollHeight,clientWidth:e.clientWidth,clientHeight:e.clientHeight}};
   });
   const freeze=document.createElement('style'); freeze.textContent='*{transition:none!important}';document.head.appendChild(freeze);
   for(const e of elements.filter(e=>e.matches('input[type=checkbox]'))) {
@@ -104,7 +114,7 @@ _RUNTIME_SCENE_CAPTURE = r"""(() => {
   const scanAnimations=rules=>{for(const rule of rules||[]){if(rule.type===CSSRule.KEYFRAMES_RULE){keyframes[rule.name]=[...rule.cssRules].map(k=>({offset:k.keyText,opacity:k.style.opacity}));}else{if(rule.style?.animationName&&rule.style.animationName!=='none')animationRules.push(rule);if(rule.cssRules)scanAnimations(rule.cssRules);}}};
   for(const sheet of document.styleSheets){try{scanAnimations(sheet.cssRules);}catch{}}
   for(const rule of animationRules)if(/^\.[\w-]+$/.test(rule.selectorText))animations[rule.selectorText.slice(1)]={duration:rule.style.animationDuration,easing:rule.style.animationTimingFunction,iterations:rule.style.animationIterationCount,frames:keyframes[rule.style.animationName]||[]};
-  return {schema:'uagent.runtime-scene/v1',viewport:{width:innerWidth,height:innerHeight},nodes,fonts,animations,testClock:window.__uagentClock??null};
+  return {schema:'uagent.runtime-scene/v1',viewport:{width:innerWidth,height:innerHeight},nodes,fonts,animations,testClock:window.__uagentClock??null,logicalState:window.__uagentState??null};
 })()"""
 
 
@@ -625,6 +635,11 @@ def capture_layout(source_dir: Path, *, viewport: tuple[int, int] = (1024, 600),
 
             identity_expression = r"""(()=>Array.from(document.querySelectorAll('*')).filter(e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'}).map((e,i)=>({index:i,attrs:Object.fromEntries(['id','data-openhmi-id','data-figma-node-id','href','pathLength','aria-pressed','aria-checked','checked'].filter(k=>e.hasAttribute(k)).map(k=>[k,e.getAttribute(k)]))})))()"""
             def merge_identities(snapshot: dict[str, Any]) -> dict[str, Any]:
+                evaluate_value('document.fonts.ready.then(()=>true)', await_promise=True)
+                if os.environ.get('UAGENT_TEST_DETERMINISTIC') == '1':
+                    advance=max(0,int(os.environ.get('UAGENT_CAPTURE_ADVANCE_MS','0')))
+                    evaluate_value(f'(async()=>{{if(!window.__uagentCapturePrepared){{window.__uagentCapturePrepared=true;window.__uagentResetRandom?.();window.__uagentAdvance?.({advance});await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));}}return true;}})()',await_promise=True)
+                    snapshot=evaluate_value(expression)
                 identities = evaluate_value(identity_expression) or []
                 by_index = {int(item.get('index')): item.get('attrs', {}) for item in identities if isinstance(item, dict)}
                 for node in snapshot.get('nodes', []):

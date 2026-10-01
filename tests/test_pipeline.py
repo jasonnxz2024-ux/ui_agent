@@ -161,3 +161,76 @@ def test_runtime_harness_does_not_replay_the_snapshot_or_infer_canvas_from_child
     main=paths['main'].read_text(encoding='utf-8')
     assert 'lv_sdl_window_create(480, 272)' in main
     assert '#ifndef UAGENT_RUNTIME_OWNS_SCENE\n    uagent_snapshot_build(screen);\n#endif' in main
+
+
+def test_effect_accumulator_readonly_state_and_conditional_string_setter(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract, resolve_actions, source_view_bindings
+    from generator.lvgl import _runtime_expression, _runtime_text_format
+    parser=Path(r'D:\aiassit\meter\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('''function App(){
+      const [fixed]=useState(7);const [speed,setSpeed]=useState(0);const [mode,setMode]=useState("idle");
+      useEffect(()=>{let phase=0;const id=setInterval(()=>{phase+=0.25;
+        const wave=Math.sin(phase);setSpeed(Math.round(wave*10));
+        if(wave<0)setMode("negative");else if(wave<0.5)setMode("low");else setMode("high");
+      },80);return()=>clearInterval(id);},[]);
+      return <div><path d="M0,0 L1,1"/><span>{speed}</span></div>;
+    }''',encoding='utf-8')
+    contract=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser)
+    assert not contract['blockers']
+    assert contract['states'][0]['setter'] is None
+    actions=resolve_actions(contract['timers'][0]['callback'],contract)
+    accumulator=next(a for a in actions if a['state'].startswith('effect_'))
+    assert accumulator['value'][2][0]=='state'  # Old snapshot must not be substituted twice.
+    speed=next(a for a in actions if a['state']=='speed')
+    assert _runtime_expression(speed['value'],contract).count('0.25')==1
+    mode=next(a for a in actions if a['state']=='mode')
+    assert _runtime_text_format([mode['value']],contract)[0]=='%s'
+    path=next(n for n in contract['jsx'] if n['tag']=='path')
+    assert path['children']==[]
+    assert not any(v.get('source_id')==f'App.tsx:{path["start"]}' for v in source_view_bindings(contract))
+
+
+def test_runtime_computed_paint_recipes_and_js_rounding():
+    from generator.lvgl import _runtime_gradient, _runtime_shadows, _runtime_expression
+    gradient=_runtime_gradient('radial-gradient(at 50% 40%, rgb(13, 16, 32) 0%, rgb(7, 8, 16) 55%, rgb(2, 3, 6) 100%)')
+    assert gradient['center']==(.5,.4)
+    assert [s['position'] for s in gradient['stops']]==[0,.55,1]
+    assert _runtime_gradient('conic-gradient(red,blue)') is None
+    assert _runtime_gradient('linear-gradient(45deg, rgb(0,0,0), rgb(255,255,255))') is None
+    shadows=_runtime_shadows('rgba(0, 0, 0, 0.8) 0px 0px 60px 0px, rgba(255, 255, 255, 0.06) 0px 0px 1px 0px inset')
+    assert len(shadows)==2 and shadows[1]['inset']
+    assert _runtime_expression(['call',['member',['id','Math'],['literal','round']],[['literal',-1.5]]],{})=='floor((-1.5)+0.5)'
+
+
+def test_conversion_rejects_source_output_alias_without_writing(tmp_path):
+    import pytest
+    from tools.runtime_convert import convert
+    source=tmp_path/'source';source.mkdir();(source/'keep.txt').write_text('unchanged',encoding='utf-8')
+    for output in (source,source/'child',tmp_path):
+        with pytest.raises(ValueError,match='disjoint'):convert(source,output,480,272)
+    assert list(source.iterdir())==[source/'keep.txt']
+    output=tmp_path/'old-output';output.mkdir();(output/'conversion-report.json').write_text('history',encoding='utf-8')
+    with pytest.raises(ValueError,match='already contains'):convert(source,output,480,272)
+    assert (output/'conversion-report.json').read_text()=='history'
+
+
+def test_effect_completeness_requires_source_bound_classified_node():
+    from copy import deepcopy
+    from generator.compiler import _merge_runtime_effect_decisions
+    message='Runtime capture contains a VisualEffect with no source-backed effect node.'
+    plan={'counts':{'VisualEffect':{'source':0,'browser':1,'planned':0}},'summary':{},
+          'blockers':['Completeness blocker: VisualEffect browser=1 > planned=0',message],
+          'decisions':[{'node_id':'browser:2:filter','kind':'VisualEffect','support':'unsupported','blockers':[message],
+                        'properties':{'source_id':'browser:2:filter','screen_index':0,'kind':'filter','value':'url("#halo")','bounds':[0,0,20,10]}}]}
+    node={'id':4,'attrs':{'data-uagent-source':'App.tsx:10'},'rect':{'x':0,'y':0,'width':20,'height':10},'style':{'filter':'url("#halo")'}}
+    captures=[{'data':{'runtime_scene':{'nodes':[node]}}}]
+    runtime={'nodes':[{'screen':0,'node':4,'support':'custom','reason':'Gaussian merge'}],'blockers':[]}
+    missing=deepcopy(plan);_merge_runtime_effect_decisions(missing,runtime,captures,{'jsx':[]})
+    assert missing['blockers']==plan['blockers']
+    classified=deepcopy(plan);_merge_runtime_effect_decisions(classified,runtime,captures,{'jsx':[{'file':'App.tsx','start':10}]})
+    assert classified['blockers']==[] and classified['counts']['VisualEffect']['planned']==1
+    runtime['blockers']=['0:4: unknown filter primitive']
+    blocked=deepcopy(plan);_merge_runtime_effect_decisions(blocked,runtime,captures,{'jsx':[{'file':'App.tsx','start':10}]})
+    assert blocked['blockers']==plan['blockers']

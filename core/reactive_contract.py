@@ -43,7 +43,7 @@ function parameters(n) {return n.parameters.map(p=>({name:ts.isIdentifier(p.name
 function statement(n) {
  if(ts.isReturnStatement(n)) return ['return',expr(n.expression)];
  if(ts.isExpressionStatement(n)) return ['expression',expr(n.expression)];
- if(ts.isVariableStatement(n)) return ['variables',n.declarationList.declarations.filter(d=>ts.isIdentifier(d.name)).map(d=>[d.name.text,expr(d.initializer)])];
+ if(ts.isVariableStatement(n)) return ['variables',n.declarationList.declarations.flatMap(d=>ts.isIdentifier(d.name)?[[d.name.text,expr(d.initializer)]]:ts.isArrayBindingPattern(d.name)&&!(ts.isCallExpression(d.initializer)&&d.initializer.expression.getText()==='useState')?d.name.elements.flatMap((e,i)=>ts.isBindingElement(e)?[[e.name.text,['member',expr(d.initializer),['literal',i]]]]:[]):[])];
  if(ts.isIfStatement(n)) return ['if',expr(n.expression),statement(n.thenStatement),n.elseStatement?statement(n.elseStatement):null];
  if(ts.isBlock(n)) return ['block',n.statements.map(statement)];
  return ['unsupported',n.getText()];
@@ -54,7 +54,7 @@ function walk(n,owner,file) {
  if(ts.isVariableDeclaration(n)&&n.initializer) {
   const init=n.initializer;
   if(ts.isArrayBindingPattern(n.name)&&ts.isCallExpression(init)&&init.expression.getText()==='useState') {
-   output.states.push({name:n.name.elements[0].name.text,setter:n.name.elements[1].name.text,owner,initial:expr(init.arguments[0]),file,start:n.pos});
+   output.states.push({name:n.name.elements[0].name.text,setter:n.name.elements[1]?.name?.text||null,owner,initial:expr(init.arguments[0]),file,start:n.pos});
   }
   if(ts.isIdentifier(n.name)) {
    let f=init;
@@ -66,16 +66,23 @@ function walk(n,owner,file) {
  if(ts.isCallExpression(n)&&n.expression.getText()==='setInterval') {
   let block=n.parent;while(block&&!ts.isBlock(block))block=block.parent;
   const callback=n.arguments[0],immediate=ts.isIdentifier(callback)&&!!block?.statements.some(s=>s.end<n.pos&&ts.isExpressionStatement(s)&&ts.isCallExpression(s.expression)&&s.expression.expression.getText()===callback.text);
-  output.timers.push({owner,callback:expr(callback),period:expr(n.arguments[1]),immediate,file,start:n.pos});
+  const persistent={};
+  for(const s of block?.statements||[])if(s.end<n.pos&&ts.isVariableStatement(s)&&(s.declarationList.flags&ts.NodeFlags.Let))for(const d of s.declarationList.declarations)if(ts.isIdentifier(d.name)&&d.initializer){
+   const name='effect_'+block.pos+'_'+d.name.text;persistent[d.name.text]=['id',name];
+   if(!output.states.some(s=>s.name===name))output.states.push({name,setter:null,owner,initial:expr(d.initializer),file,start:d.pos,internal:true});
+  }
+  const replace=value=>Array.isArray(value)?(value[0]==='id'&&persistent[value[1]]?persistent[value[1]]:value.map(replace)):value;
+  output.timers.push({owner,callback:replace(expr(callback)),period:expr(n.arguments[1]),immediate,file,start:n.pos});
  }
  if(ts.isJsxOpeningElement(n)||ts.isJsxSelfClosingElement(n)) {
   const attrs={}; for(const a of n.attributes.properties) if(ts.isJsxAttribute(a)) {
    attrs[a.name.text]=!a.initializer?['literal',true]:ts.isJsxExpression(a.initializer)?expr(a.initializer.expression):expr(a.initializer);
    if(attrs[a.name.text]?.[0]==='id') (output.aliases[a.name.text]??=[]).push(attrs[a.name.text][1]);
   }
-  const children=ts.isJsxElement(n.parent)?n.parent.children.filter(c=>ts.isJsxText(c)||ts.isJsxExpression(c)).map(c=>ts.isJsxText(c)?['literal',c.text.trim()]:expr(c.expression)).filter(Boolean):[];
+  const children=ts.isJsxOpeningElement(n)&&ts.isJsxElement(n.parent)?n.parent.children.filter(c=>ts.isJsxText(c)||ts.isJsxExpression(c)).map(c=>ts.isJsxText(c)?['literal',c.text.trim()]:expr(c.expression)).filter(Boolean):[];
   const loops=[];for(let p=n.parent;p;p=p.parent) if(ts.isArrowFunction(p)&&ts.isCallExpression(p.parent)&&ts.isPropertyAccessExpression(p.parent.expression)&&p.parent.expression.name.text==='map') loops.push({items:expr(p.parent.expression.expression),parameters:parameters(p)});
-  output.jsx.push({tag:n.tagName.getText(),attrs,children,owner,file,start:n.pos,end:ts.isJsxElement(n.parent)?n.parent.end:n.end,loops});
+  const guards=[];for(let p=n.parent;p;p=p.parent)if(ts.isBinaryExpression(p)&&p.operatorToken.kind===K.AmpersandAmpersandToken&&n.pos>=p.right.pos&&n.end<=p.right.end)guards.push(expr(p.left));
+  output.jsx.push({tag:n.tagName.getText(),attrs,children,owner,file,start:n.pos,end:ts.isJsxOpeningElement(n)&&ts.isJsxElement(n.parent)?n.parent.end:n.end,loops,guards});
  }
  ts.forEachChild(n,c=>walk(c,owner,file));
 }
@@ -94,7 +101,29 @@ def extract_reactive_contract(source_dir: Path, source_files: list[str], *, pars
                             capture_output=True, text=True, encoding='utf-8', timeout=20)
     if result.returncode:
         return {'schema': 'uagent.reactive-contract/v1', 'blockers': [result.stderr[-2000:]]}
-    return json.loads(result.stdout)
+    contract=json.loads(result.stdout)
+    names=[state['name'] for state in contract.get('states',[])]
+    if len(set(names))!=len(names):contract['blockers'].append('Ambiguous duplicate state names across component/effect scopes')
+    return contract
+
+
+def instrument_browser_source(source_dir: Path, files: list[str], parser: Path) -> None:
+    """Annotate an explicitly isolated browser copy, leaving compiler input intact."""
+    script=r'''
+const fs=require('fs'),path=require('path'),ts=require(process.argv[1]),root=process.argv[2];
+for(const file of JSON.parse(process.argv[3])){
+ const name=path.join(root,file),text=fs.readFileSync(name,'utf8'),tree=ts.createSourceFile(file,text,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX),edits=[];
+ function visit(n){
+  if((ts.isJsxOpeningElement(n)||ts.isJsxSelfClosingElement(n))&&/^[a-z]/.test(n.tagName.getText()))edits.push([n.attributes.end,` data-uagent-source=${JSON.stringify(file+':'+n.pos)}`]);
+  if(ts.isVariableStatement(n))for(const d of n.declarationList.declarations)if(ts.isArrayBindingPattern(d.name)&&d.initializer&&ts.isCallExpression(d.initializer)&&d.initializer.expression.getText()==='useState'){
+   const state=d.name.elements[0].name.text;edits.push([n.end,`;globalThis.__uagentState??={};globalThis.__uagentState[${JSON.stringify(state)}]=${state};`]);
+  }
+  ts.forEachChild(n,visit);
+ }
+ visit(tree);let result=text;for(const [at,insert]of edits.sort((a,b)=>b[0]-a[0]))result=result.slice(0,at)+insert+result.slice(at);fs.writeFileSync(name,result);
+}
+'''
+    subprocess.run([shutil.which('node') or 'node','-e',script,str(parser),str(source_dir),json.dumps(files)],check=True,capture_output=True,text=True,timeout=20)
 
 
 def substitute(expr: Any, env: dict[str, Any]) -> Any:
@@ -122,7 +151,8 @@ def literal(expr: Any, constants: dict[str, Any] | None = None) -> Any:
 def resolve_actions(callback: Any, contract: dict[str, Any], event_value: Any = None) -> list[dict[str, Any]]:
     """Resolve supported setters through source functions and JSX prop aliases."""
     functions = contract.get('functions', {})
-    setters = {s['setter']: s for s in contract.get('states', [])}
+    setters = {s['setter']: s for s in contract.get('states', []) if s.get('setter')}
+    persistent = {s['name'] for s in contract.get('states', []) if s.get('internal')}
     actions: list[dict[str, Any]] = []
     event_value = event_value or ['event']
 
@@ -135,7 +165,7 @@ def resolve_actions(callback: Any, contract: dict[str, Any], event_value: Any = 
             return expression(value[2][0], env)
         return value
 
-    def invoke(value: Any, args: list[Any], env: dict[str, Any], depth: int = 0) -> None:
+    def invoke(value: Any, args: list[Any], env: dict[str, Any], depth: int = 0, guard: Any = None) -> None:
         if depth > 12:
             raise ValueError('Recursive event handler is unsupported')
         if value and value[0] == 'id':
@@ -156,9 +186,9 @@ def resolve_actions(callback: Any, contract: dict[str, Any], event_value: Any = 
                         field = literal(expression(key, env))
                         if not isinstance(field, str):
                             raise ValueError('Unresolved computed state key')
-                        actions.append({'state':state['name'],'field':field,'value':expression(item,env)})
+                        actions.append({'state':state['name'],'field':field,'value':expression(item,env),**({'guard':guard} if guard else {})})
                 else:
-                    actions.append({'state':state['name'],'field':None,'value':assigned})
+                    actions.append({'state':state['name'],'field':None,'value':assigned,**({'guard':guard} if guard else {})})
                 return
             aliases = contract.get('aliases', {}).get(name, [])
             if name not in functions and len(aliases) == 1:
@@ -170,13 +200,33 @@ def resolve_actions(callback: Any, contract: dict[str, Any], event_value: Any = 
         for i, p in enumerate(value[1]):
             if p['name']:
                 local[p['name']] = args[i] if i < len(args) else event_value
-        for statement in value[2]:
+        execute(value[2], local, depth, guard)
+
+    def execute(statements: list[Any], local: dict[str,Any], depth: int, guard: Any) -> None:
+        for statement in statements:
             if statement[0] in {'expression','return'} and statement[1] and statement[1][0] == 'call':
                 call = statement[1]
-                invoke(call[1], [expression(a,local) for a in call[2]], local, depth+1)
+                invoke(call[1], [expression(a,local) for a in call[2]], local, depth+1, guard)
+            elif statement[0]=='expression' and statement[1] and statement[1][0]=='binary' and statement[1][1] in {'=','+=','-=','*='}:
+                _,operator,target,right=statement[1]
+                if target[0]!='id' or target[1] not in persistent:
+                    raise ValueError('Unsupported mutation outside a captured effect variable')
+                if guard:raise ValueError('Conditional mutation of an effect variable requires a control-flow merge')
+                previous=local.get(target[1],['state',target[1]])
+                assigned=expression(right,local) if operator=='=' else ['binary',operator[0],previous,expression(right,local)]
+                actions.append({'state':target[1],'field':None,'value':assigned,**({'guard':guard} if guard else {})})
+                local[target[1]]=assigned
             elif statement[0] == 'variables':
                 for name, value in statement[1]:
                     local[name] = expression(value, local)
+            elif statement[0]=='block':
+                execute(statement[1],local,depth,guard)
+            elif statement[0]=='if':
+                condition=expression(statement[1],local)
+                yes=['binary','&&',guard,condition] if guard else condition
+                no=['binary','&&',guard,['unary','!',condition]] if guard else ['unary','!',condition]
+                execute([statement[2]],dict(local),depth,yes)
+                if statement[3]:execute([statement[3]],dict(local),depth,no)
             elif statement[0] != 'return':
                 raise ValueError('Unsupported event statement')
 
@@ -189,7 +239,15 @@ def resolve_actions(callback: Any, contract: dict[str, Any], event_value: Any = 
     else:
         argument = event_value
     invoke(callback, [argument], {})
-    return actions
+    combined: dict[tuple[str,str|None],dict[str,Any]] = {}
+    for action in actions:
+        key=(action['state'],action['field'])
+        guard=action.pop('guard',None)
+        if guard:
+            previous=combined[key]['value'] if key in combined else (['id',key[0]] if key[1] is None else ['member',['id',key[0]],['literal',key[1]]])
+            action['value']=['conditional',guard,action['value'],previous]
+        combined[key]=action
+    return list(combined.values())
 
 
 def source_control_bindings(contract: dict[str, Any]) -> list[dict[str, Any]]:
@@ -232,6 +290,20 @@ def source_view_bindings(contract: dict[str, Any]) -> list[dict[str, Any]]:
     jsx = contract.get('jsx', [])
     functions = contract.get('functions', {})
     views = []
+    state_names={s['name'] for s in contract.get('states',[])}
+    def dynamic(value):
+        return isinstance(value,list) and (len(value)==2 and value[0]=='id' and value[1] in state_names or any(dynamic(v) for v in value))
+    for node in jsx:
+        definition=functions.get(node['owner'])
+        if not definition or definition[1] or not node['tag'][0].islower():continue
+        env={}
+        for statement in definition[2]:
+            if statement[0]=='variables':
+                for name,value in statement[1]:env[name]=substitute(value,env)
+        child={'tag':node['tag'],'attrs':{k:substitute(v,env) for k,v in node['attrs'].items()},'texts':[substitute(v,env) for v in node['children']],
+               'guards':[substitute(v,env) for v in node.get('guards',[])]}
+        if dynamic(child['texts']) or any(dynamic(v) for v in child['attrs'].values()):
+            views.append({'source_id':f'{node["file"]}:{node["start"]}','identity':f'{node["file"]}:{node["start"]}','children':[child]})
     for usage in jsx:
         definition = functions.get(usage['tag'])
         if not definition:
