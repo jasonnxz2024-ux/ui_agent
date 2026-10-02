@@ -8,7 +8,8 @@ hiddenimports = (['server.app'] + collect_submodules('uvicorn') + collect_submod
                  collect_submodules('pydantic') +
                  collect_submodules('anyio') + collect_submodules('server') +
                  collect_submodules('core') + collect_submodules('generator') +
-                 collect_submodules('adapters'))
+                 collect_submodules('adapters') +
+                 ['tools.runtime_convert', 'tools.cross_validate', 'tools.interaction_probe'])
 
 a = Analysis(
     ['D:/uagent/launcher.py'],
@@ -33,4 +34,12 @@ exe = EXE(
     upx=True,
     console=False,
     disable_windowed_traceback=False,
+)
+
+# A console entry for unattended conversion, using the same bundled compiler.
+# Keep the desktop entry unchanged for existing users.
+converter = EXE(
+    pyz, a.scripts, a.binaries, a.datas, [],
+    name='UAgent-Convert', debug=False, bootloader_ignore_signals=False,
+    strip=False, upx=True, console=True, disable_windowed_traceback=False,
 )

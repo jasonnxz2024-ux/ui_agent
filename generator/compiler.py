@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
 from shutil import copy2
 from pathlib import Path
@@ -12,6 +13,7 @@ from core.capability import capability_plan_dict, plan_capabilities
 from core.browser_layout import browser_background_paint
 from core.planning_agent import run_planning_agent
 from core.reactive_contract import extract_reactive_contract, source_control_bindings, source_view_bindings, resolve_actions
+from core.state_rules import compile_state_rules
 
 from .lvgl import LVGLRenderer, bundle, resource_filename, runtime_scene_bundle
 from .model import GenerationBundle
@@ -45,7 +47,7 @@ def _merge_runtime_effect_decisions(planning: dict, runtime: dict, captures: lis
             rect=node['rect']
             if any(abs(float(rect[k])-float(value))>.05 for k,value in zip(('x','y','width','height'),bounds)):continue
             keys={'filter':['filter'],'gradient':['backgroundImage'],'shadow':['boxShadow','textShadow']}.get(props.get('kind'),[])
-            if props.get('value') not in [node['style'].get(key) for key in keys]:continue
+            if props.get('value') not in [styles.get(key) for styles in (node['style'],node.get('sourceStyle',{})) for key in keys]:continue
             candidates.append((node,receipt,identity))
         if len(candidates)!=1:continue
         node,receipt,identity=candidates[0]
@@ -130,10 +132,19 @@ def compile_lvgl(model: ReactProjectModel) -> GenerationBundle:
     tree = build_screen_tree(model, reachable)
     if any(s.get('data', {}).get('runtime_scene') for s in (model.browser_evidence or {}).get('screens', [])):
         contract = extract_reactive_contract(model.source_dir, [model.components[c].source_file for c in reachable])
+        contract['list_capacity']=int(os.environ.get('UAGENT_LIST_CAPACITY','64'))
+        contract['state_rules'] = compile_state_rules(contract, contract['list_capacity'])
+        contract['blockers'].extend(contract['state_rules']['blockers'])
+        # A timeout was previously absent from the interval-only contract.
+        # Preserve it as a requirement until event-owned scheduling is lowered.
+        for task in contract.get('tasks', []):
+            if task['kind'] == 'timeout':
+                contract['blockers'].append(f'{task["id"]}: timeout requires event/effect-owned task scheduling and cancellation')
         contract['controls'] = source_control_bindings(contract)
         contract['views'] = source_view_bindings(contract)
         for timer in contract.get('timers', []):
             try:
+                if not timer.get('effectOwned'):raise ValueError('Event-created interval requires lifecycle scheduling; it must not start at application launch')
                 timer['actions'] = resolve_actions(timer['callback'], contract)
             except ValueError as exc:
                 timer['blocker'] = str(exc)
@@ -154,6 +165,7 @@ def compile_lvgl(model: ReactProjectModel) -> GenerationBundle:
             'limitations': runtime.get('limitations', []),
             'visual_validation': 'requires external browser/SDL comparison',
         }}
+        output.agent_planning['summary']['state_rules'] = tree.get('reactive_contract', {}).get('state_rules', {}).get('summary', {})
         output.agent_planning['blockers'] = [*output.agent_planning.get('blockers', []), *runtime['blockers']]
         if runtime['blockers']:
             output.agent_planning['status'] = 'blocked'

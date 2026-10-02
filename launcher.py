@@ -19,6 +19,13 @@ def _free_port() -> int:
 
 
 def main() -> None:
+    # The console sibling and GUI --convert share the exact local compiler.
+    # No server, browser UI or model service is needed to invoke the command.
+    if '--convert' in sys.argv[1:2] or os.path.basename(sys.executable).lower() == 'uagent-convert.exe':
+        if sys.argv[1:2] == ['--convert']:
+            del sys.argv[1]
+        from tools.runtime_convert import main as convert_main
+        raise SystemExit(convert_main())
     startup_log = os.environ.get("UAGENT_STARTUP_LOG", "").strip()
 
     def trace(message: str) -> None:

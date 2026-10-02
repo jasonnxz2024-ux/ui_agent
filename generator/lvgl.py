@@ -22,6 +22,26 @@ from .model import GeneratedUnit, GenerationBundle
 from core.reactive_contract import literal as reactive_literal, substitute as reactive_substitute
 
 
+def _runtime_is_array(value: Any, contract: dict) -> bool:
+    return isinstance(value,list) and bool(value) and (value[0] in {'array','array-drop'} or value[0]=='id' and any(s['name']==value[1] and isinstance(reactive_literal(s['initial']),list) for s in contract.get('states',[])))
+
+
+def _runtime_numeric_array(value,contract):
+    if not isinstance(value,list) or not value:return False
+    if value[0]=='id':return any(s['name']==value[1] and isinstance(reactive_literal(s['initial']),list) and all(isinstance(v,(int,float)) for v in reactive_literal(s['initial'])) for s in contract.get('states',[]))
+    if value[0]=='array':return bool(value[1]) and all((e[0]=='literal' and isinstance(e[1],(int,float))) or (e[0]=='member' and _runtime_numeric_array(e[1],contract)) for e in value[1])
+    if value[0]=='conditional':return _runtime_numeric_array(value[2],contract) and _runtime_numeric_array(value[3],contract)
+    return False
+
+
+def _runtime_string(value: Any, contract: dict) -> bool:
+    if not isinstance(value,list) or not value:return False
+    return (value[0]=='event-text' or value[0]=='literal' and isinstance(value[1],str)
+            or value[0]=='id' and any(s['name']==value[1] and isinstance(reactive_literal(s['initial']),str) for s in contract.get('states',[]))
+            or value[0]=='member' and _runtime_is_array(value[1],contract) and not _runtime_numeric_array(value[1],contract) and reactive_literal(value[2])!='length'
+            or value[0]=='conditional' and _runtime_string(value[2],contract) and _runtime_string(value[3],contract))
+
+
 def _runtime_function_return(value: Any, contract: dict[str,Any]) -> Any:
     if value[0]!='call' or value[1][0]!='id' or value[1][1] not in contract.get('functions',{}):
         raise ValueError('Unsupported pure helper call')
@@ -36,13 +56,31 @@ def _runtime_function_return(value: Any, contract: dict[str,Any]) -> Any:
 
 
 def _runtime_expression(value: Any, contract: dict[str, Any], depth: int = 0) -> str:
-    if depth > 24 or not isinstance(value,list):
+    if depth > 96 or not isinstance(value,list):
         raise ValueError('Unsupported or recursive reactive expression')
     kind = value[0]
+    if kind=='local':return 'runtime_local_'+c_symbol(value[1])
+    if kind=='pointer':return 'runtime_pointer_'+value[1]
+    if kind=='gesture':return 'runtime_gesture_'+value[1]+'_'+value[2]
+    if kind=='layout':
+        offset=contract.get('layout_offsets',{}).get(str(value[1]),{}).get(value[2],0)
+        return f'(runtime_layout(runtime_0_{int(value[1])},{["left","top","width","height"].index(value[2])})+{offset:.9f})'
     if kind == 'literal':
         return _c_string(value[1]) if isinstance(value[1],str) else ('1' if value[1] is True else '0' if value[1] in (False,None) else repr(value[1]))
-    if kind == 'event':
+    if kind in {'event','event-text'}:
         return 'value'
+    if kind=='array':
+        if _runtime_numeric_array(value,contract):
+            result='((runtime_num_array_t){0})'
+            for element in value[1]:result=f'runtime_num_append({result},{_runtime_expression(element,contract,depth+1)})'
+            return result
+        result='((runtime_array_t){0})'
+        for element in value[1]:
+            if element[0]=='spread':result=f'runtime_array_concat({result},{_runtime_expression(element[1],contract,depth+1)})'
+            elif _runtime_string(element,contract):result=f'runtime_array_append({result},{_runtime_expression(element,contract,depth+1)})'
+            else:raise ValueError('Bounded arrays currently require strings')
+        return result
+    if kind=='array-drop':return f'runtime_array_drop({_runtime_expression(value[1],contract,depth+1)})'
     if kind == 'state':
         return 'runtime_state_'+c_symbol(value[1])
     if kind == 'id':
@@ -51,6 +89,11 @@ def _runtime_expression(value: Any, contract: dict[str, Any], depth: int = 0) ->
         if any(s['name']==value[1] for s in contract.get('states',[])):
             return 'runtime_state_'+c_symbol(value[1])
     if kind == 'member':
+        if _runtime_is_array(value[1],contract) and not (value[1][0]=='array' and all(e[0]!='spread' for e in value[1][1]) and isinstance(reactive_literal(value[2]),int)):
+            array=_runtime_expression(value[1],contract,depth+1)
+            if reactive_literal(value[2])=='length':return f'({array}).count'
+            getter='runtime_num_get' if _runtime_numeric_array(value[1],contract) else 'runtime_array_get'
+            return f'{getter}({array},(int)({_runtime_expression(value[2],contract,depth+1)}))'
         if value[1][0]=='array' and isinstance(reactive_literal(value[2]),int):
             return _runtime_expression(value[1][1][reactive_literal(value[2])],contract,depth+1)
         if value[1][0]=='call' and value[1][1][0]=='id' and value[1][1][1] in contract.get('functions',{}):
@@ -62,7 +105,7 @@ def _runtime_expression(value: Any, contract: dict[str, Any], depth: int = 0) ->
     if kind == 'binary':
         operator={'===':'==','!==':'!='}.get(value[1],value[1])
         def string_operand(v):
-            return v[0]=='literal' and isinstance(v[1],str) or v[0]=='id' and any(s['name']==v[1] and isinstance(reactive_literal(s['initial']),str) for s in contract.get('states',[]))
+            return _runtime_string(v,contract)
         if string_operand(value[2]) or string_operand(value[3]):
             if operator not in {'==','!='} or not (string_operand(value[2]) and string_operand(value[3])):raise ValueError('Unsupported mixed string operator')
             return f'(strcmp({_runtime_expression(value[2],contract,depth+1)},{_runtime_expression(value[3],contract,depth+1)}) {operator} 0)'
@@ -136,7 +179,7 @@ def _runtime_text_format(expressions: list[Any], contract: dict[str,Any]) -> tup
                 fmt+=f'%.{int(precision)}f';arguments.append('(double)'+_runtime_expression(target,contract));return
             if method=='padStart' and target[0]=='call' and target[1]==['id','String'] and reactive_literal(value[2][1])=='0':
                 fmt+=f'%0{int(reactive_literal(value[2][0]))}d';arguments.append('(int)'+_runtime_expression(target[2][0],contract));return
-        if value[0]=='id' and any(s['name']==value[1] and isinstance(reactive_literal(s['initial']),str) for s in contract.get('states',[])):
+        if _runtime_string(value,contract):
             fmt+='%s';arguments.append(_runtime_expression(value,contract));return
         if value[0]=='conditional':
             def string_value(v):
@@ -160,7 +203,9 @@ def _runtime_gradient(value: str) -> dict[str,Any] | None:
         if match:center=tuple(float(v)/100 for v in match.groups())
         elif heading not in ('','ellipse'):return None
     else:
-        axes={'':0,'to bottom':0,'to top':1,'to right':2,'to left':3}
+        axes={'':0,'to bottom':0,'to top':1,'to right':2,'to left':3,
+              'to right bottom':4,'to bottom right':4,'to left bottom':5,'to bottom left':5,
+              'to right top':6,'to top right':6,'to left top':7,'to top left':7}
         if heading not in axes:return None
         axis=axes[heading]
     stops=[]
@@ -191,16 +236,45 @@ def runtime_scene_bundle(model: ReactProjectModel, screen_tree: dict[str, Any]) 
     page screenshots are embedded in the generated runtime.
     """
     captures = (model.browser_evidence or {}).get('screens', [])
+    captures=[*captures,*(sample for capture in captures for sample in capture.get('state_samples',[]) if sample.get('compile_variant'))]
     if not captures or not all((s.get('data', {}).get('runtime_scene') or {}).get('schema') == 'uagent.runtime-scene/v1' for s in captures):
         return None
     scenes = [s['data']['runtime_scene'] for s in captures]
     contract = screen_tree.get('reactive_contract', {})
+    list_capacity=contract.get('list_capacity',64)
+    if type(list_capacity) is not int or not 1<=list_capacity<=1024:raise ValueError('List capacity must be an integer between 1 and 1024')
+    if contract.get('subscriptions') or contract.get('gestures'):
+        from core.pointer_model import expand_pointer_instances
+        try:contract=expand_pointer_instances(contract,scenes)
+        except (ValueError,KeyError,TypeError) as exc:
+            contract={**contract,'blockers':[*contract.get('blockers',[]),f'Instance pointer model: {exc}']}
+    if contract.get('keyed_lists'):
+        for scene in scenes:
+            for node in scene['nodes']:
+                if node.get('baseRect'):node['rect']=node['baseRect'];node['texts']=node.get('baseTexts',node['texts'])
     fonts: dict[str, Any] = {}
     for scene in scenes:
-        fonts.update(scene.get('fonts', {}))
+        for key,font in scene.get('fonts',{}).items():
+            previous=fonts.get(key)
+            glyphs={g['code']:g for g in (previous or {}).get('glyphs',[])}
+            glyphs.update({g['code']:g for g in font['glyphs']})
+            fonts[key]={**font,'glyphs':[glyphs[k] for k in sorted(glyphs)]}
     font_ids = {key: f'uagent_font_{i}' for i, key in enumerate(fonts)}
     lines = ['#include "custom.h"', '#include <math.h>', '#include <stdlib.h>', '#include <string.h>', '#include <stdio.h>',
+             f'#define UAGENT_LIST_CAPACITY {list_capacity}',
              'typedef struct {const lv_font_t *font; const uint32_t *codes; const float *advance; unsigned count;} runtime_font_t;']
+    lines += [r'''
+/* Bounded string arrays: overflow is an explicit runtime failure, never wrap. */
+typedef struct {int count;char items[UAGENT_LIST_CAPACITY][128];} runtime_array_t;
+typedef struct {int count;double items[UAGENT_LIST_CAPACITY];} runtime_num_array_t;
+static void runtime_array_fail(void){fputs("BLOCKER: runtime string array capacity/index exceeded\n",stderr);exit(3);}
+static runtime_num_array_t runtime_num_append(runtime_num_array_t a,double v){if(a.count>=UAGENT_LIST_CAPACITY||!isfinite(v))runtime_array_fail();a.items[a.count++]=v;return a;}
+static double runtime_num_get(runtime_num_array_t a,int i){if(i<0||i>=a.count)runtime_array_fail();return a.items[i];}
+static runtime_array_t runtime_array_append(runtime_array_t a,const char *s){if(a.count>=UAGENT_LIST_CAPACITY||strlen(s)>=128)runtime_array_fail();strcpy(a.items[a.count++],s);return a;}
+static runtime_array_t runtime_array_concat(runtime_array_t a,runtime_array_t b){for(int i=0;i<b.count;i++)a=runtime_array_append(a,b.items[i]);return a;}
+static runtime_array_t runtime_array_drop(runtime_array_t a){if(a.count>0)a.count--;return a;}
+static const char *runtime_array_get(runtime_array_t a,int i){static char slots[32][128];static unsigned slot;if(i<0||i>=a.count)runtime_array_fail();slot=(slot+1)%32;strcpy(slots[slot],a.items[i]);return slots[slot];}
+''']
     for key, font in fonts.items():
         symbol = font_ids[key]
         bitmap = bytearray()
@@ -301,7 +375,7 @@ static void runtime_gradient(lv_obj_t *parent,int w,int h,int radial,float cx,fl
     for(int y=0;y<h;y++)for(int x=0;x<w;x++) {
         float t;
         if(radial){float dx=(x+.5f-w*cx)/fmaxf(1,w*fmaxf(cx,1-cx)),dy=(y+.5f-h*cy)/fmaxf(1,h*fmaxf(cy,1-cy));t=sqrtf((dx*dx+dy*dy)*.5f);}
-        else t=axis==0?(y+.5f)/h:axis==1?1-(y+.5f)/h:axis==2?(x+.5f)/w:1-(x+.5f)/w;
+        else {float u=(x+.5f)/w,v=(y+.5f)/h;t=axis==0?v:axis==1?1-v:axis==2?u:axis==3?1-u:axis==4?(u+v)*.5f:axis==5?(1-u+v)*.5f:axis==6?(u+1-v)*.5f:(2-u-v)*.5f;}
         int i=0;while(i<count-2&&t>stops[i+1].at)i++;
         const runtime_stop_t *a=&stops[i],*b=&stops[i+1];float f=fminf(1,fmaxf(0,(t-a->at)/fmaxf(.00001f,b->at-a->at)));
         float alpha=a->a+(b->a-a->a)*f,den=fmaxf(alpha,.00001f);
@@ -352,6 +426,7 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
     limitations: list[str] = []
     controls = contract.get('controls', [])
     control_ids = {c['identity']:i for i,c in enumerate(controls)}
+    source_control_ids={(c['source_id'],c.get('ordinal',0)):i for i,c in enumerate(controls) if c.get('source_id')}
     control_kinds: dict[int,str] = {}
     state_values = {s['name']:reactive_literal(s['initial']) for s in contract.get('states', [])}
     state_variables: dict[tuple[str,str|None],str] = {}
@@ -362,29 +437,93 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
             state_variables[(state,field)] = name
             if isinstance(initial,str): lines.append(f'static char {name}[128]={_c_string(initial)};')
             elif isinstance(initial,(int,float,bool)): lines.append(f'static double {name}={int(initial) if isinstance(initial,bool) else repr(initial)};')
+            elif isinstance(initial,list) and initial and len(initial)<=list_capacity and all(isinstance(v,str) and len(v.encode('utf-8'))<128 for v in initial):
+                lines.append(f'static runtime_array_t {name}={{.count={len(initial)},.items={{'+','.join(_c_string(v) for v in initial)+'}};')
+                limitations.append(f'{state}: bounded string array, capacity {list_capacity}, UTF-8 item capacity 127 bytes; overflow exits with BLOCKER')
+            elif isinstance(initial,list) and initial and len(initial)<=list_capacity and all(isinstance(v,(int,float)) for v in initial):
+                lines.append(f'static runtime_num_array_t {name}={{.count={len(initial)},.items={{'+','.join(str(v) for v in initial)+'}};')
+                limitations.append(f'{state}: bounded numeric array, capacity {list_capacity}; overflow exits with BLOCKER')
             else: blockers.append(f'Unsupported initial state: {state}.{field}')
     lines += ['#include <time.h>', 'static uint32_t runtime_seed=1;', 'static int64_t runtime_clock_ms;',
               'static double runtime_random(void) { runtime_seed=runtime_seed*1664525u+1013904223u;return runtime_seed/4294967296.0; }',
               'static int runtime_clock_part(int part) {time_t value=(time_t)(runtime_clock_ms/1000);struct tm *t=localtime(&value);return part==0?t->tm_hour:part==1?t->tm_min:t->tm_sec;}',
               'static uint32_t runtime_css_color(const char *s) {if(s&&s[0]==\'#\')return (uint32_t)strtoul(s+1,NULL,16);if(s&&strstr(s,"rgb"))s=strstr(s,"rgb");int r=0,g=0,b=0;if(s&&(sscanf(s,"rgba(%d,%d,%d",&r,&g,&b)==3||sscanf(s,"rgb(%d,%d,%d",&r,&g,&b)==3))return (r<<16)|(g<<8)|b;return 0;}',
-              'static void runtime_sync(void);', 'static void runtime_advance(int milliseconds);']
+              'static int runtime_syncing;', 'static void runtime_sync(void);', 'static void runtime_advance(int milliseconds);',
+              'static double runtime_pointer_x,runtime_pointer_y;',
+              'static double runtime_gesture_offset_x,runtime_gesture_offset_y,runtime_gesture_velocity_x,runtime_gesture_velocity_y;',
+              'static double runtime_layout(lv_obj_t *o,int part){lv_area_t a;lv_obj_update_layout(o);lv_obj_get_coords(o,&a);return part==0?a.x1:part==1?a.y1:part==2?lv_obj_get_width(o):lv_obj_get_height(o);}']
     for i in range(len(controls)):
         lines.append(f'static void runtime_control_{i}(lv_event_t *event);')
+    if contract.get('keyed_lists'):lines.append('static void runtime_drag_event(lv_event_t *event);')
     sync: list[str] = []
     bound_controls: set[int] = set()
     receipts = []
     object_refs: list[tuple[str, str, str]] = []
+    scroll_refs=[]
     routes = [str(s.get('state') or (s.get('path') or [''])[ -1]).casefold() for s in captures]
+    variants=all('variant_state' in c for c in captures)
+    text_states={a['state'] for c in controls for a in c.get('actions',[]) if a['value']==['event-text']}
+    jsx_by_source={f'{j["file"]}:{j["start"]}':j for j in contract.get('jsx',[])}
+    svg_assets = {}
     for screen_index, scene in enumerate(scenes):
         nodes = {int(n['id']): n for n in scene['nodes']}
         declarations = []
         body = [f'static void runtime_build_{screen_index}(void) {{', f'    runtime_pages[{screen_index}]=runtime_box(NULL,0,0,{scene["viewport"]["width"]},{scene["viewport"]["height"]});']
         rendered: dict[int, str] = {}
+        source_ordinals={}
+        # Dynamic SVG views need mutable geometry. Finite state variants own
+        # their distinct authored SVG assets; ordinary reactive views do not.
+        def lineage(item):
+            chain=[item['id']]
+            while nodes[chain[-1]].get('parent') in nodes:
+                chain.append(nodes[chain[-1]]['parent'])
+            return chain
+        dynamic_roots=set()
+        for view in contract.get('views',[]) if not variants else []:
+            roots=[n for n in nodes.values() if
+                   (view.get('source_id') and n['attrs'].get('data-uagent-source')==view['source_id'] or
+                    not view.get('source_id') and n['attrs'].get('aria-label')==view.get('identity') and n['attrs'].get('role')==view.get('role'))]
+            if view.get('callsite'):roots=[n for n in roots if n['attrs'].get('data-uagent-callsite')==view['callsite']]
+            for root in roots:
+                # Match the same source elements as the live binding pass, not
+                # every unrelated icon inside a component with a changing label.
+                if root['tag']=='svg':dynamic_roots.add(root['id'])
+                children=[root] if view.get('source_id') else [n for n in nodes.values() if root['id'] in lineage(n)[1:]]
+                ordinals={}
+                for child in view.get('children',[]):
+                    tag=child['tag'];ordinal=ordinals.get(tag,0);ordinals[tag]=ordinal+1
+                    matches=[n for n in children if n['tag']==tag]
+                    if ordinal<len(matches) and (child.get('guards') or
+                        any(reactive_literal(v) is None for v in child.get('attrs',{}).values()) or
+                        any(reactive_literal(v) is None for v in child.get('texts',[]))):
+                        dynamic_roots.add(matches[ordinal]['id'])
+        control_sources={key[0] for key in source_control_ids}
+        interactive_nodes={n['id'] for n in nodes.values() if n['attrs'].get('data-uagent-source') in control_sources}
+        asset_roots={n['id']:n['svgAsset'] for n in nodes.values() if n.get('svgAsset') and
+                     not any(n['id'] in lineage(nodes[root]) for root in dynamic_roots) and
+                     not any(n['id'] in lineage(nodes[child])[1:] for child in interactive_nodes) and
+                     not any(n['id'] in lineage(child) and (child['tag'] not in {'svg','g','path','circle','ellipse','rect','line','polyline','polygon','title','desc','defs','pattern','text','tspan'} or
+                             any(child['style'].get(k) not in (None,'','none') for k in ('filter','clipPath','maskImage','backgroundImage','boxShadow','textShadow')))
+                             for child in nodes.values())}
+        asset_owners={n['id']:next((p for p in lineage(n)[1:] if p in asset_roots),None) for n in nodes.values()}
+        asset_roots.update({n['id']:n['imageAsset'] for n in nodes.values() if n.get('imageAsset')})
         for node_id, node in nodes.items():
             tag, rect, style, attrs = node['tag'], node['rect'], node['style'], node['attrs']
             ref = f'runtime_{screen_index}_{node_id}'
+            source_id=attrs.get('data-uagent-source');source_ordinal=source_ordinals.get(source_id,0)
+            source_ordinals[source_id]=source_ordinal+1
+            if asset_owners[node_id] is not None:
+                reason=f'original SVG element retained in source asset of node {asset_owners[node_id]}'
+                receipts.append({'screen':screen_index,'node':node_id,'parent':node.get('parent'),'tag':tag,'support':'custom','reason':reason})
+                units.append(GeneratedUnit(source_id=f'browser:{screen_index}:{node_id}',symbol=ref,adapter='RuntimeSceneAdapter',widget_type=tag,support='custom',c_code='',decisions={'reason':reason,'rect':rect,'parent':node.get('parent')}))
+                continue
+            source_ci=source_control_ids.get((source_id,source_ordinal))
             reason = 'measured DOM node'
             support = 'native'
+            for cosmetic in ('backdropFilter','animationName'):
+                if style.get(cosmetic) not in (None,'','none'):
+                    limitations.append(f'{screen_index}:{node_id}: {cosmetic} is frozen/omitted under the static-endpoint visual policy')
+                    support,reason='partial',f'{cosmetic} frozen/omitted; source node retained'
             gradient=_runtime_gradient(style.get('backgroundImage','none'))
             effect=node.get('effect') or {}
             glow_sigma=effect.get('sigma',0) if effect.get('kind')=='gaussian-merge-glow' else 0
@@ -433,15 +572,34 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
                 x, y = pixel(rect['x']) - pixel(parent_rect['x']), pixel(rect['y']) - pixel(parent_rect['y'])
                 width, height = pixel(rect['x']+rect['width'])-pixel(rect['x']), pixel(rect['y']+rect['height'])-pixel(rect['y'])
                 declarations.append(f'static lv_obj_t * {ref};')
-                if tag in {'path','line','polyline','polygon','rect','ellipse'} and (node.get('geometry') or {}).get('points'):
+                if node_id in asset_roots:
+                    asset=asset_roots[node_id];aw,ah=asset['width'],asset['height']
+                    rgba_bytes=base64.b64decode(asset['rgba'],validate=True)
+                    if not (0<aw*ah<=1048576 and len(rgba_bytes)==aw*ah*4):raise ValueError('Invalid source SVG asset dimensions/data')
+                    digest=hashlib.sha256(str((aw,ah)).encode()+rgba_bytes).hexdigest()
+                    name='runtime_svg_'+digest[:20]
+                    if digest not in svg_assets:
+                        bgra=bytearray(rgba_bytes);bgra[0::4],bgra[2::4]=rgba_bytes[2::4],rgba_bytes[0::4]
+                        lines.append(f'static const uint8_t {name}_pixels[]={{'+','.join(str(b) for b in bgra)+'};')
+                        lines.append(f'static const lv_image_dsc_t {name}={{.header={{.magic=LV_IMAGE_HEADER_MAGIC,.cf=LV_COLOR_FORMAT_ARGB8888,.w={aw},.h={ah},.stride={aw*4}}},.data_size={len(bgra)},.data={name}_pixels}};')
+                        svg_assets[digest]=name
+                    body += [f'    {ref}=lv_image_create({parent});lv_obj_remove_style_all({ref});lv_image_set_src({ref},&{name});',
+                             f'    lv_obj_set_pos({ref},{asset["x"]-pixel(parent_rect["x"])},{asset["y"]-pixel(parent_rect["y"])});lv_obj_clear_flag({ref},LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);']
+                    support,reason='custom','original source asset reused as transparent pixels; no replacement artwork'
+                    limitations.append(f'{screen_index}:{node_id}: SVG asset uses captured pixel size; other sizes/colors require a new asset')
+                elif tag in {'path','line','polyline','polygon','rect','ellipse'} and (node.get('geometry') or {}).get('points'):
                     points=node['geometry']['points'];stroke,opacity=rgba(style.get('stroke'));fill,fill_alpha=rgba(style.get('fill'))
+                    stroke_width=number(style.get('strokeWidth'),1)*node['geometry'].get('strokeScale',1)
+                    if node['geometry'].get('subpaths',1)>1 or not node['geometry'].get('uniform',True):
+                        support,reason='unsupported','mutable SVG with multiple subpaths or nonuniform transform requires a dedicated geometry recipe'
+                        blockers.append(f'{screen_index}:{node_id}: {reason}')
                     declarations.append(f'static const lv_point_precise_t {ref}_points[]={{'+','.join('{%.5ff,%.5ff}'%tuple(p) for p in points)+'};')
                     body += [f'    {ref}=lv_line_create({parent});lv_obj_remove_style_all({ref});lv_obj_set_pos({ref},{x},{y});',
-                             f'    lv_line_set_points({ref},{ref}_points,{len(points)});lv_obj_set_style_line_width({ref},{max(1,round(number(style.get("strokeWidth"),1)))},0);',
+                             f'    lv_line_set_points({ref},{ref}_points,{len(points)});lv_obj_set_style_line_width({ref},{max(1,round(stroke_width))},0);',
                              f'    lv_obj_set_style_line_color({ref},lv_color_hex({stroke}),0);lv_obj_set_style_line_opa({ref},255,0);lv_obj_set_style_opa_layered({ref},{opacity},0);lv_obj_set_style_line_rounded({ref},{str(style.get("strokeLinecap")=="round").lower()},0);',
                              f'    lv_obj_clear_flag({ref},LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);lv_obj_add_flag({ref},LV_OBJ_FLAG_OVERFLOW_VISIBLE);']
                     if glow_supported:
-                        body.append(f'    {{runtime_path_info_t *p=runtime_path_info({ref});memcpy(p->points,{ref}_points,sizeof({ref}_points));p->count={len(points)};p->sigma={glow_sigma:.6f}f;p->width={number(style.get("strokeWidth"),1):.6f}f;p->color={stroke};p->opacity=255;runtime_path_blur({ref},p);}}')
+                        body.append(f'    {{runtime_path_info_t *p=runtime_path_info({ref});memcpy(p->points,{ref}_points,sizeof({ref}_points));p->count={len(points)};p->sigma={glow_sigma:.6f}f;p->width={stroke_width:.6f}f;p->color={stroke};p->opacity=255;runtime_path_blur({ref},p);}}')
                     if fill_alpha and tag!='line':
                         support,reason='unsupported','SVG filled geometry needs a fill recipe'
                         blockers.append(f'{screen_index}:{node_id}: {reason}')
@@ -452,15 +610,30 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
                              f'    lv_obj_set_style_bg_color({ref},lv_color_hex({fill}),0);lv_obj_set_style_bg_opa({ref},{fill_alpha},0);']
                 elif tag == 'circle':
                     stroke, opacity = rgba(style.get('stroke'))
-                    stroke_width = number(style.get('strokeWidth'), 1)
+                    geometry=node.get('geometry') or {}
+                    stroke_width = number(style.get('strokeWidth'), 1)*geometry.get('strokeScale',1)
                     radius = number(attrs.get('r'))
+                    source_radius = radius
                     cx, cy = number(attrs.get('cx')), number(attrs.get('cy'))
                     rotation = re.search(r'rotate\(\s*([-+\d.]+)', attrs.get('transform', ''))
                     angle = number(rotation.group(1)) if rotation else 0
+                    matrix=geometry.get('matrix')
+                    if matrix:
+                        a,b,c,d,tx,ty=matrix
+                        cx,cy=a*cx+c*cy+tx-parent_rect['x'],b*cx+d*cy+ty-parent_rect['y']
+                        radius*=math.hypot(a,b)
+                        angle=math.degrees(math.atan2(b,a))
+                        if not geometry.get('uniform',True) or a*d-b*c<=0:
+                            support,reason='unsupported','mutable SVG circle with skew/nonuniform/reflected transform requires a dedicated geometry recipe'
+                            blockers.append(f'{screen_index}:{node_id}: {reason}')
                     dash = [number(v) for v in re.findall(r'[-+\d.]+', style.get('strokeDasharray', ''))]
                     offset = number(style.get('strokeDashoffset'))
-                    span = 360 * dash[0] / (2 * math.pi * radius) if dash and radius else 360
-                    start = (angle - offset / radius * 180 / math.pi) % 360 if radius else angle
+                    span = 360 * dash[0] / (2 * math.pi * source_radius) if dash and source_radius else 360
+                    start = (angle - offset / source_radius * 180 / math.pi) % 360 if source_radius else angle
+                    if dash and source_radius and abs(dash[0]-2*math.pi*source_radius)<.05 and (len(dash)==1 or dash[1]>=2*math.pi*source_radius):
+                        if not -.05<=offset<=2*math.pi*source_radius+.05:raise ValueError('Circle progress dash offset is outside one circumference')
+                        start=angle%360;span=max(0,360-offset/source_radius*180/math.pi)
+                    if span>=359.999:start=0;span=360
                     diameter = round(2 * radius + stroke_width)
                     body += [f'    {ref}=lv_arc_create({parent}); lv_obj_remove_style_all({ref});',
                              f'    lv_obj_set_pos({ref},{round(cx-radius-stroke_width/2)},{round(cy-radius-stroke_width/2)}); lv_obj_set_size({ref},{diameter},{diameter});',
@@ -476,7 +649,9 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
                     body.append(f'    {ref}=runtime_box({parent},{x},{y},{width},{height});')
                     color, opacity = rgba(style['backgroundColor'])
                     body += [f'    lv_obj_set_style_bg_color({ref},lv_color_hex({color}),0); lv_obj_set_style_bg_opa({ref},{opacity},0);',
-                             f'    lv_obj_set_style_radius({ref},{round(number(style["borderRadius"]))},0);']
+                             f'    lv_obj_set_style_radius({ref},{round(min(width/2,height/2,number(style["borderRadius"],min(width,height)/2 if "infinity" in style["borderRadius"] else 0)))},0);']
+                    if style.get('overflowX') in {'hidden','clip'} or style.get('overflowY') in {'hidden','clip'}:
+                        body.append(f'    lv_obj_set_style_clip_corner({ref},true,0);')
                     if gradient:
                         stops=','.join('{'+','.join(f'{v:.6f}f' for v in [s['position'],*s['rgba']])+'}' for s in gradient['stops'])
                         body.append(f'    {{static const runtime_stop_t stops[]={{{stops}}};runtime_gradient({ref},{width},{height},{int(gradient["radial"])},{gradient["center"][0]:.6f}f,{gradient["center"][1]:.6f}f,{gradient["axis"]},stops,{len(gradient["stops"])});}}')
@@ -487,7 +662,14 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
                                 body.append(f'    {{lv_obj_t *b=runtime_box({ref},{bx},{by},{bw},{bh});lv_obj_set_style_bg_color(b,lv_color_hex({shadow_color}),0);lv_obj_set_style_bg_opa(b,{shadow_alpha},0);}}')
                         else:
                             body.append(f'    lv_obj_set_style_shadow_width({ref},{round(shadow["blur"])},0);lv_obj_set_style_shadow_spread({ref},{round(shadow["spread"])},0);lv_obj_set_style_shadow_offset_x({ref},{round(shadow["x"])},0);lv_obj_set_style_shadow_offset_y({ref},{round(shadow["y"])},0);lv_obj_set_style_shadow_color({ref},lv_color_hex({shadow_color}),0);lv_obj_set_style_shadow_opa({ref},{shadow_alpha},0);')
-                    for edge in ('Top','Right','Bottom','Left'):
+                    edges=('Top','Right','Bottom','Left')
+                    borders=[(round(number(style.get(f'border{edge}Width'))),rgba(style.get(f'border{edge}Color'))) for edge in edges]
+                    if borders[0][0]>0 and len(set(borders))==1:
+                        thick,(color,alpha)=borders[0]
+                        radius=round(min(width/2,height/2,number(style['borderRadius'],min(width,height)/2 if 'infinity' in style['borderRadius'] else 0)))
+                        body.append(f'    {{lv_obj_t *b=runtime_box({ref},0,0,{width},{height});lv_obj_set_style_radius(b,{radius},0);lv_obj_set_style_border_width(b,{thick},0);lv_obj_set_style_border_color(b,lv_color_hex({color}),0);lv_obj_set_style_border_opa(b,{alpha},0);}}')
+                        edges=()
+                    for edge in edges:
                         thick = round(number(style.get(f'border{edge}Width')))
                         if not thick:
                             continue
@@ -495,11 +677,16 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
                         bx, by, bw, bh = {'Top':(0,0,width,thick),'Right':(width-thick,0,thick,height),'Bottom':(0,height-thick,width,thick),'Left':(0,0,thick,height)}[edge]
                         body.append(f'    {{ lv_obj_t *b=runtime_box({ref},{bx},{by},{bw},{bh}); lv_obj_set_style_bg_color(b,lv_color_hex({color}),0); lv_obj_set_style_bg_opa(b,{alpha},0); }}')
                 rendered[node_id] = ref
+                for list_index,keyed in enumerate(contract.get('keyed_lists',[])):
+                    if node_id in keyed['nodes']:
+                        body.append(f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_CLICKABLE);lv_obj_add_event_cb({ref},runtime_drag_event,LV_EVENT_ALL,(void*)(intptr_t){list_index});')
                 if style['overflowX'] == 'visible' and style['overflowY'] == 'visible' or tag in {'text','g','path','line','circle','rect','ellipse','polyline','polygon'}:
                     body.append(f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_OVERFLOW_VISIBLE);')
                 if style['overflowY'] in {'auto', 'scroll'}:
                     body += [f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_CLICKABLE); lv_obj_set_scroll_dir({ref},LV_DIR_VER); lv_obj_set_scrollbar_mode({ref},LV_SCROLLBAR_MODE_OFF);']
                     object_refs.append((f'scroll:{screen_index}', ref, 'scroll'))
+                    object_refs.append(('scroll:active',ref,'scroll'))
+                    scroll_refs.append((screen_index,source_id,ref))
                 opacity = round(number(style.get('opacity'), 1) * 255)
                 if opacity < 255:
                     body.append(f'    lv_obj_set_style_opa({ref},{opacity},0);')
@@ -518,16 +705,43 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
                         sigma=glow_sigma if glow_supported else text_shadows[0]['blur']/2
                         shadow_color,shadow_alpha=(color,255) if glow_supported else rgba(text_shadows[0]['color'])
                         body.append(f'    {{runtime_text_info_t *p=lv_obj_get_user_data({text_ref});p->sigma={sigma:.6f}f;p->glow_color={shadow_color};p->glow_opa={shadow_alpha};runtime_text_set({text_ref},{_c_string(txt)});}}')
+                    if variants and source_id in jsx_by_source:
+                        expressions=jsx_by_source[source_id]['children']
+                        def uses_input(v):return isinstance(v,list) and (len(v)==2 and v[0]=='id' and v[1] in text_states or any(uses_input(x) for x in v))
+                        if uses_input(expressions):
+                            try:
+                                fmt,args=_runtime_text_format(expressions,contract)
+                                sync.append(f'    {{char text[256];snprintf(text,sizeof(text),{_c_string(fmt)},'+','.join(args)+f');runtime_text_set({text_ref},text);}}')
+                            except ValueError as exc:blockers.append(f'{source_id}: {exc}')
                 if tag == 'button':
                     body.append(f'    lv_obj_add_flag({ref},LV_OBJ_FLAG_CLICKABLE);')
                     page = str(attrs.get('data-page', '')).casefold()
                     key=attrs.get('aria-label') or ''.join(t['text'].strip() for t in node['texts'])
-                    if key in control_ids:
-                        ci=control_ids[key];bound_controls.add(ci);control_kinds[ci]='button'
+                    if source_ci is not None or key in control_ids:
+                        ci=source_ci if source_ci is not None else control_ids[key];bound_controls.add(ci);control_kinds[ci]='button'
+                        key=controls[ci]['identity']
                         body.append(f'    lv_obj_add_event_cb({ref},runtime_control_{ci},LV_EVENT_CLICKED,NULL);')
                     elif page in routes:
                         body.append(f'    lv_obj_add_event_cb({ref},runtime_nav,LV_EVENT_CLICKED,(void*)(intptr_t){routes.index(page)});')
                     object_refs.append((key, ref, 'button'))
+                if tag=='input' and attrs.get('type') in {'date','time','text'}:
+                    if source_ci is None:
+                        blockers.append(f'{screen_index}:{node_id}: text input has no source binding')
+                    else:
+                        ci=source_ci;bound_controls.add(ci);control_kinds[ci]='text'
+                        declarations.append(f'static lv_obj_t *{ref}_input;')
+                        body += [f'    {ref}_input=lv_textarea_create({ref});lv_obj_remove_style_all({ref}_input);lv_obj_set_size({ref}_input,{width},{height});',
+                                 f'    lv_textarea_set_one_line({ref}_input,true);lv_textarea_set_max_length({ref}_input,127);lv_obj_set_style_pad_left({ref}_input,12,0);lv_obj_set_style_pad_top({ref}_input,8,0);',
+                                 f'    lv_textarea_set_text({ref}_input,{_c_string(str(node["native"].get("value") or ""))});']
+                        if node.get('font'):body.append(f'    lv_obj_set_style_text_font({ref}_input,&{font_ids[node["font"]]},0);')
+                        body.append(f'    lv_obj_add_event_cb({ref}_input,runtime_control_{ci},LV_EVENT_VALUE_CHANGED,NULL);')
+                        object_refs.append((controls[ci]['identity'],ref+'_input','text'))
+                        actions=controls[ci]['actions']
+                        if len(actions)==1:
+                            variable=state_variables.get((actions[0]['state'],None))
+                            if variable:sync.append(f'    if(strcmp(lv_textarea_get_text({ref}_input),{variable}))lv_textarea_set_text({ref}_input,{variable});')
+                        limitations.append(f'{screen_index}:{node_id}: native {attrs["type"]} picker represented as an editable value; OS popup/locale formatting is not reproduced')
+                        support,reason='partial','editable native value; browser date/time popup and validation are not reproduced'
                 if tag == 'input' and attrs.get('type') == 'range':
                     native = node['native']
                     declarations.append(f'static lv_obj_t * {ref}_slider;')
@@ -601,12 +815,17 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
                     ancestor=nodes.get(ancestor,{}).get('parent')
             return result
         for view in contract.get('views',[]):
+            if variants:continue  # Finite paint variants are selected by compiled source state below.
             if view.get('source_id'):
                 # Old receipts lack source instrumentation; retain legacy
                 # labelled bindings there, but never infer ordinal identities.
                 if not any(n['attrs'].get('data-uagent-source') for n in nodes.values()):continue
                 roots=[n for n in nodes.values() if n['attrs'].get('data-uagent-source')==view['source_id']]
-                if not roots: blockers.append(f'{view["identity"]}: dynamic source node not observed in browser evidence')
+                if view.get('callsite'):roots=[n for n in roots if n['attrs'].get('data-uagent-callsite')==view['callsite']]
+                if not roots and not any(n['attrs'].get('data-uagent-source')==view['source_id'] and
+                        (not view.get('callsite') or n['attrs'].get('data-uagent-callsite')==view['callsite'])
+                        for captured in scenes for n in captured['nodes']):
+                    blockers.append(f'{view["identity"]}: dynamic source node not observed in browser evidence')
             else:
                 roots=[n for n in nodes.values() if n['attrs'].get('aria-label')==view['identity'] and n['attrs'].get('role')==view['role']]
             for root_node in roots:
@@ -626,8 +845,12 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
                             if offset:
                                 radius=number(child['attrs'].get('r'));rotation=re.search(r'rotate\(\s*([-+\d.]+)',child['attrs'].get('transform',''))
                                 angle=number(rotation.group(1)) if rotation else 0;dash=[number(v) for v in re.findall(r'[-+\d.]+',child['style'].get('strokeDasharray',''))]
+                                matrix=(child.get('geometry') or {}).get('matrix')
+                                if matrix:angle=math.degrees(math.atan2(matrix[1],matrix[0]))
                                 span=360*dash[0]/(2*math.pi*radius) if dash and radius else 360
-                                sync.append(f'    {{double start=fmod({angle}-({_runtime_expression(offset,contract)})/{radius}*180.0/3.141592653589793+720.0,360.0);lv_arc_set_angles({ref},(int)round(start),(int)round(start+{span}));}}')
+                                if dash and radius and abs(dash[0]-2*math.pi*radius)<.05 and (len(dash)==1 or dash[1]>=2*math.pi*radius):
+                                    sync.append(f'    {{double offset={_runtime_expression(offset,contract)};if(offset<-.05||offset>{2*math.pi*radius+.05})runtime_array_fail();double start=fmod({angle}+720.0,360.0),span=fmax(0,360-offset/{radius}*180.0/3.141592653589793);if(span>=359.999){{start=0;span=360;}}lv_arc_set_angles({ref},(int)round(start),(int)round(start+span));}}')
+                                else:sync.append(f'    {{double start=fmod({angle}-({_runtime_expression(offset,contract)})/{radius}*180.0/3.141592653589793+720.0,360.0);lv_arc_set_angles({ref},(int)round(start),(int)round(start+{span}));}}')
                         if child['texts'] and source_child['texts']:
                             shadow_style=source_child['attrs'].get('style')
                             if shadow_style and shadow_style[0]=='object':
@@ -644,6 +867,9 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
                             if fill and reactive_literal(fill) is None:
                                 sync.append(f'    {{uint32_t color=runtime_css_color({_runtime_expression(fill,contract)});((runtime_text_info_t*)lv_obj_get_user_data({ref}_text_0))->color=color;for(uint32_t i=0;i<lv_obj_get_child_count({ref}_text_0);i++)lv_obj_set_style_text_color(lv_obj_get_child({ref}_text_0,i),lv_color_hex(color),0);}}')
                         if tag=='path' and source_child['attrs'].get('d') and reactive_literal(source_child['attrs']['d']) is None:
+                            matrix=(child.get('geometry') or {}).get('matrix')
+                            if matrix and any(abs(a-b)>.0001 for a,b in zip(matrix[:4],[1,0,0,1])):
+                                raise ValueError('Reactive arc transform requires a mutable transformed path recipe')
                             fmt,args=_runtime_text_format([source_child['attrs']['d']],contract)
                             skeleton=re.sub(r'%[-+.\d]*[fgds]','0',fmt)
                             if not re.fullmatch(r'M[-+\d.,]+ A[-+\d.,]+',skeleton):raise ValueError('Reactive SVG path is not a single supported circular arc')
@@ -680,24 +906,87 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
                     except ValueError as exc:
                         blockers.append(f'{view["identity"]}: {exc}')
     def assignments(actions:list[dict[str,Any]]) -> list[str]:
-        statements=[];commits=[]
+        statements=[];commits=[];declared=set()
         for index,action in enumerate(actions):
+            for binding in action.get('bindings',[]):
+                if binding['name'] in declared:continue
+                if _runtime_string(binding['value'],contract) or _runtime_is_array(binding['value'],contract):raise ValueError('Updater local requires a numeric value')
+                statements.append(f'    double runtime_local_{c_symbol(binding["name"])}={_runtime_expression(binding["value"],contract)};')
+                declared.add(binding['name'])
             variable=state_variables.get((action['state'],action['field']))
             if not variable: raise ValueError(f'Unresolved state destination {action["state"]}.{action["field"]}')
             initial=state_values[action['state']]
             if action['field'] is not None: initial=initial[action['field']]
-            if isinstance(initial,str):
+            if isinstance(initial,list):
+                array_type='runtime_num_array_t' if all(isinstance(v,(int,float)) for v in initial) else 'runtime_array_t'
+                statements.append(f'    {array_type} next_{index}={_runtime_expression(action["value"],contract)};')
+                commits.append(f'    {variable}=next_{index};')
+            elif isinstance(initial,str):
                 fmt,args=_runtime_text_format([action['value']],contract)
-                statements.append(f'    char next_{index}[128];snprintf(next_{index},sizeof(next_{index}),{_c_string(fmt)}'+(','+','.join(args) if args else '')+');')
+                statements.append(f'    char next_{index}[128];int written_{index}=snprintf(next_{index},sizeof(next_{index}),{_c_string(fmt)}'+(','+','.join(args) if args else '')+');')
+                statements.append(f'    if(written_{index}<0 || written_{index}>=(int)sizeof(next_{index})){{fputs("BLOCKER: state text capacity exceeded\\n",stderr);exit(3);}}')
                 commits.append(f'    snprintf({variable},sizeof({variable}),"%s",next_{index});')
             else:
                 statements.append(f'    double next_{index}={_runtime_expression(action["value"],contract)};')
                 commits.append(f'    {variable}=next_{index};')
         return statements+commits
+    for translation in contract.get('translations',[]):
+        node=scenes[0]['nodes'][translation['node']]
+        parent=next((n for n in scenes[0]['nodes'] if n['id']==node.get('parent')),{'rect':{'x':0,'y':0}})
+        coords=[]
+        for axis,key in enumerate(('x','y')):
+            base=node['rect'][key]-parent['rect'][key]-translation['origin'][axis]
+            coords.append(f'(int)floor({base:.9f}+({_runtime_expression(translation["axes"][axis],contract)})+.5)')
+        sync.append(f'    lv_obj_set_pos(runtime_0_{node["id"]},{coords[0]},{coords[1]});')
+    for keyed in contract.get('keyed_lists',[]):
+        scene_nodes={n['id']:n for n in scenes[0]['nodes']}
+        state=state_variables[(keyed['state'],None)]
+        sync.append(f'    if({state}.count!={len(keyed["order"])})runtime_array_fail();')
+        for source_index,node_id in zip(keyed['order'],keyed['nodes']):
+            ref=f'runtime_0_{node_id}';sync.append('    {int matches=0;')
+            for slot,target_id in enumerate(keyed['nodes']):
+                target=scene_nodes[target_id];parent=scene_nodes.get(target.get('parent'),{'rect':{'x':0,'y':0}})
+                matrix=[float(v) for v in re.findall(r'[-+]?\d*\.?\d+(?:e[-+]?\d+)?',target['style'].get('transform','none'))]
+                if target['style'].get('transform','none')=='none':matrix=[1,0,0,1,0,0]
+                if len(matrix)!=6:raise ValueError('Keyed item needs a 2D matrix transform')
+                a,b,c,d,tx,ty=matrix;scale=math.hypot(a,b)
+                if abs(scale-math.hypot(c,d))>.001:raise ValueError('Keyed item nonuniform scale is not supported')
+                x=target['rect']['x']-parent['rect']['x']+tx;y=target['rect']['y']-parent['rect']['y']+ty
+                sync.append(f'    if(runtime_num_get({state},{slot})=={source_index}){{matches++;lv_obj_set_pos({ref},{round(x)},{round(y)});lv_obj_set_style_transform_rotation({ref},{round(math.degrees(math.atan2(b,a))*10)},0);lv_obj_set_style_transform_scale_x({ref},{round(scale*256)},0);lv_obj_set_style_transform_scale_y({ref},{round(scale*256)},0);}}')
+            sync.append('    if(matches!=1)runtime_array_fail();}')
+        for slot in reversed(range(len(keyed['order']))):
+            for source_index,node_id in zip(keyed['order'],keyed['nodes']):sync.append(f'    if(runtime_num_get({state},{slot})=={source_index})lv_obj_move_to_index(runtime_0_{node_id},-1);')
+    if contract.get('keyed_lists'):
+        lines.append('static void runtime_gesture_end(int list,double dx,double dy,double vx,double vy){runtime_gesture_offset_x=dx;runtime_gesture_offset_y=dy;runtime_gesture_velocity_x=vx;runtime_gesture_velocity_y=vy;')
+        for index,keyed in enumerate(contract['keyed_lists']):
+            lines.append(f'    if(list=={index}){{');lines+=assignments(keyed['actions']);lines.append('    }')
+        lines+=['    runtime_sync();','}',r'''
+static void runtime_drag_event(lv_event_t *event){
+    static lv_point_t start,history[32];static uint32_t times[32];static int count,active;
+    lv_indev_t *input=lv_indev_active();if(!input)return;lv_point_t p;lv_indev_get_point(input,&p);uint32_t now=lv_tick_get();
+    lv_event_code_t code=lv_event_get_code(event);
+    if(code==LV_EVENT_PRESSED){active=1;start=p;count=1;history[0]=p;times[0]=now;}
+    if(active&&code==LV_EVENT_PRESSING){if(count==32){memmove(history,history+1,31*sizeof(*history));memmove(times,times+1,31*sizeof(*times));count=31;}history[count]=p;times[count++]=now;}
+    if(active&&code==LV_EVENT_RELEASED){active=0;int i=0;while(i+1<count&&now-times[i]>100)i++;double dt=now-times[i],vx=dt>0?(p.x-history[i].x)*1000.0/dt:0,vy=dt>0?(p.y-history[i].y)*1000.0/dt:0;
+        runtime_gesture_end((int)(intptr_t)lv_event_get_user_data(event),p.x-start.x,p.y-start.y,vx,vy);}
+    if(code==LV_EVENT_PRESS_LOST)active=0;
+}
+''']
+        limitations.append('Keyed numeric permutation reuses existing objects. Drag release uses a 100ms pointer velocity window; spring/elastic intermediate frames are not reproduced.')
+    if contract.get('pointers'):
+        lines.append('static void runtime_pointer_move(double x,double y){runtime_pointer_x=x;runtime_pointer_y=y;')
+        for pointer in contract['pointers']:
+            lines.append('    {');lines+=assignments(pointer['actions']);lines.append('    }')
+        lines+=['    runtime_sync();','}',
+                'static void runtime_pointer_poll(void){static int x=0,y=0;for(lv_indev_t *i=lv_indev_get_next(NULL);i;i=lv_indev_get_next(i)){if(lv_indev_get_type(i)==LV_INDEV_TYPE_POINTER){lv_point_t p;lv_indev_get_point(i,&p);if(p.x!=x||p.y!=y){x=p.x;y=p.y;runtime_pointer_move(x,y);}break;}}}']
+        limitations.append('Instance-local pointer state compiled from source; mounted instance set and layout are fixed to the captured viewport.')
+    else:lines.append('static void runtime_pointer_poll(void){}')
     for i,control in enumerate(controls):
         lines.append(f'static void runtime_control_{i}(lv_event_t *event) {{')
+        lines.append('    if(runtime_syncing)return;')
         kind=control_kinds.get(i)
         if kind=='range': lines.append('    double value=lv_slider_get_value(lv_event_get_target_obj(event));')
+        elif kind=='text':lines.append('    const char *value=lv_textarea_get_text(lv_event_get_target_obj(event));')
         elif kind=='checkbox' and control['actions']:
             action=control['actions'][0];variable=state_variables.get((action['state'],action['field']),'0')
             lines.append(f'    double value=!{variable};')
@@ -730,16 +1019,58 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
             if len(matches)==1:
                 node,ti=matches[0];sync.append(f'    runtime_text_set(runtime_{screen_index}_{node["id"]}_text_{ti},{state_variables[(state,None)]});')
             else: blockers.append(f'{screen_index}: clock text mapping is ambiguous')
+    if variants:
+        mount=[]
+        for navigation in contract.get('navigation',[]):
+            route_state=navigation['state'];route_var=state_variables.get((route_state,None))
+            if not route_var:continue
+            cases={reactive_literal(c['value']):c['component'] for c in navigation['cases'] if c['value'] is not None}
+            default=next((c['component'] for c in navigation['cases'] if c['value'] is None),None)
+            observed={c['variant_state'].get(route_state) for c in captures}
+            for missing in set(cases)-observed:blockers.append(f'{route_state}: source route {missing} lacks runtime evidence')
+            owners=list(dict.fromkeys([*cases.values(),default]))
+            mount.append('    {static int mounted=-1;int owner='+str(owners.index(default))+';')
+            for route,owner in cases.items():mount.append(f'    if(!strcmp({route_var},{_c_string(route)}))owner={owners.index(owner)};')
+            mount.append('    if(owner!=mounted){')
+            for state in contract.get('states',[]):
+                if state['owner'] not in owners:continue
+                variable=state_variables[(state['name'],None)];initial=state_values[state['name']]
+                if isinstance(initial,str):reset=f'snprintf({variable},sizeof({variable}),"%s",{_c_string(initial)});'
+                elif isinstance(initial,(int,float,bool)):reset=f'{variable}={int(initial) if isinstance(initial,bool) else repr(initial)};'
+                else:blockers.append(f'{state["name"]}: component remount initial type unsupported');continue
+                mount.append(f'    if(owner=={owners.index(state["owner"])}){{{reset}}}')
+            mount+=['    mounted=owner;}}']
+        select=['    {int page=-1;']
+        for index,capture in enumerate(captures):
+            conditions=[]
+            for state,value in capture['variant_state'].items():
+                if state in text_states or not isinstance(value,(str,bool,int,float)) or state not in state_values:continue
+                variable=state_variables[(state,None)]
+                conditions.append(f'!strcmp({variable},{_c_string(value)})' if isinstance(value,str) else f'{variable}=={int(value) if isinstance(value,bool) else value}')
+            if not conditions:blockers.append(f'variant {index}: no source state selector');continue
+            select.append(f'    if(page<0 && ('+' && '.join(conditions)+f'))page={index};')
+        select+=['    if(page<0){fputs("BLOCKER: runtime state has no captured paint variant\\n",stderr);exit(3);}',
+                 '    if(lv_screen_active()!=runtime_pages[page]){']
+        route_names=[n['state'] for n in contract.get('navigation',[])]
+        for target_index,identity,target_ref in scroll_refs:
+            select.append(f'    if(page=={target_index}){{int scroll=0;')
+            for old_index,old_identity,old_ref in scroll_refs:
+                if identity==old_identity and all(captures[old_index]['variant_state'].get(n)==captures[target_index]['variant_state'].get(n) for n in route_names):
+                    select.append(f'    if(lv_screen_active()==runtime_pages[{old_index}])scroll=lv_obj_get_scroll_y({old_ref});')
+            select.append(f'    lv_obj_update_layout(runtime_pages[{target_index}]);lv_obj_scroll_to_y({target_ref},scroll,LV_ANIM_OFF);}}')
+        select+=['    lv_screen_load(runtime_pages[page]);}}']
+        sync=mount+sync+select
+        limitations.append('Finite source-state paint variants; unobserved variants fail explicitly. Component remounts reset local state; complex reconciliation is not implemented.')
     for state,value in state_values.items():
-        if isinstance(value,str) and value.casefold() in routes:
+        if not variants and isinstance(value,str) and value.casefold() in routes:
             for index,route in enumerate(routes):
                 sync.append(f'    if(!strcmp({state_variables[(state,None)]},{_c_string(route)}) && lv_screen_active()!=runtime_pages[{index}]) lv_screen_load(runtime_pages[{index}]);')
-    lines+=['static void runtime_sync(void) {']+sync+['}']
+    lines+=['static void runtime_sync(void) {if(runtime_syncing)return;runtime_syncing=1;']+sync+['    runtime_syncing=0;','}']
     lines+=['static void runtime_advance(int milliseconds) {', '    int64_t end=runtime_clock_ms+milliseconds;', '    while(1) {int64_t next=end+1;']
     for index,period,_ in timers: lines.append(f'        if(runtime_due_{index}<next)next=runtime_due_{index};')
     lines+=['        if(next>end)break;runtime_clock_ms=next;']
     for index,period,_ in timers: lines.append(f'        if(runtime_due_{index}<=next){{runtime_tick_{index}();runtime_due_{index}+={period};}}')
-    lines+=['    }runtime_clock_ms=end;runtime_sync();}', 'static uint32_t runtime_last_tick;', 'static void runtime_timer(lv_timer_t *timer) {(void)timer;uint32_t now=lv_tick_get(),elapsed=now-runtime_last_tick;runtime_last_tick=now;runtime_advance((int)elapsed);}']
+    lines+=['    }runtime_clock_ms=end;runtime_sync();}', 'static uint32_t runtime_last_tick;', 'static void runtime_timer(lv_timer_t *timer) {(void)timer;uint32_t now=lv_tick_get(),elapsed=now-runtime_last_tick;runtime_last_tick=now;runtime_pointer_poll();runtime_advance((int)elapsed);}']
     lines+=['void uagent_runtime_dump(const char *path) {', '    FILE *file=fopen(path,"wb");if(!file)return;', '    fputs("{",file);']
     first=True
     for state,value in state_values.items():
@@ -750,7 +1081,10 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
         for fi,(field,initial) in enumerate(fields):
             if field is not None: lines.append(f'    fputs({_c_string(("," if fi else "")+json.dumps(field)+":")},file);')
             variable=state_variables[(state,field)]
-            if isinstance(initial,str): lines.append(f'    fprintf(file,"\\\"%s\\\"",{variable});')
+            if isinstance(initial,list):
+                value_format='%.12g' if all(isinstance(v,(int,float)) for v in initial) else '\\"%s\\"'
+                lines.append(f'    fputc(\'[\',file);for(int i=0;i<{variable}.count;i++){{if(i)fputc(\',\',file);fprintf(file,"{value_format}",{variable}.items[i]);}}fputc(\']\',file);')
+            elif isinstance(initial,str): lines.append(f'    fprintf(file,"\\\"%s\\\"",{variable});')
             elif isinstance(initial,bool): lines.append(f'    fputs({variable}?"true":"false",file);')
             else: lines.append(f'    fprintf(file,"%.12g",{variable});')
         if isinstance(value,dict): lines.append('    fputs("}",file);')
@@ -759,12 +1093,19 @@ static void runtime_svg_arc(lv_obj_t *o,const char *d,float origin_x,float origi
     # event callbacks as SDL input, without automating the user's desktop.
     lines += ['int uagent_runtime_action(const char *key,double value) {']
     lines.append('    if(!strcmp(key,"@advance")){runtime_advance((int)value);return 1;}')
+    if contract.get('pointers'):lines.append('    if(!strncmp(key,"@pointer:",9)){runtime_pointer_move(strtod(key+9,NULL),value);return 1;}')
+    if contract.get('keyed_lists'):lines.append('    if(!strncmp(key,"@gesture:",9)){int list;double dx,dy,vx;if(sscanf(key+9,"%d,%lf,%lf,%lf",&list,&dx,&dy,&vx)!=4)return 0;runtime_gesture_end(list,dx,dy,vx,value);return 1;}')
     for key, ref, kind in object_refs:
+        active=f'lv_obj_get_screen({ref})==lv_screen_active()'
+        if kind=='text':
+            prefix=key+'='
+            lines.append(f'    if({active} && !strncmp(key,{_c_string(prefix)},{len(prefix.encode("utf-8"))})){{runtime_syncing=1;lv_textarea_set_text({ref},key+{len(prefix.encode("utf-8"))});runtime_syncing=0;lv_obj_send_event({ref},LV_EVENT_VALUE_CHANGED,NULL);return 1;}}')
+            continue
         if kind == 'range':
             action=f'lv_slider_set_value({ref},(int)value,LV_ANIM_OFF);lv_obj_send_event({ref},LV_EVENT_VALUE_CHANGED,NULL);'
         else:
             action = f'lv_obj_scroll_to_y({ref},(int)value,LV_ANIM_OFF);' if kind == 'scroll' else f'lv_obj_send_event({ref},LV_EVENT_CLICKED,NULL);'
-        lines.append(f'    if(!strcmp(key,{_c_string(key)})) {{ {action} return 1; }}')
+        lines.append(f'    if({active} && !strcmp(key,{_c_string(key)})) {{ {action} return 1; }}')
     lines += ['    return 0;', '}', 'void custom_init(void) {']
     lines+=['    const char *clock=getenv("UAGENT_TEST_CLOCK_MS");runtime_clock_ms=clock?strtoll(clock,NULL,10):(int64_t)time(NULL)*1000;',
             '    if(!getenv("UAGENT_TEST_DETERMINISTIC"))runtime_seed=(uint32_t)time(NULL);']

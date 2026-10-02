@@ -39,19 +39,23 @@ _DETERMINISTIC_BROWSER_SCRIPT = r"""(()=>{
   window.__uagentClock=clock;
   window.setInterval=(fn,delay)=>{jobs.push({fn,delay,next:clock+delay});return jobs.length;};
   window.clearInterval=id=>{if(jobs[id-1])jobs[id-1].fn=null;};
-  window.__uagentAdvance=ms=>{const end=clock+ms;while(true){const next=Math.min(...jobs.filter(j=>j.fn).map(j=>j.next));if(next>end)break;clock=next;for(const j of jobs)if(j.fn&&j.next<=clock){j.fn();j.next+=j.delay;}}clock=end;window.__uagentClock=clock;};
+  window.__uagentAdvance=ms=>{const end=clock+ms;while(true){const next=Math.min(...jobs.filter(j=>j.fn).map(j=>j.next));if(next>end)break;clock=next;for(const j of jobs)if(j.fn&&j.next<=clock){if(window.__uagentFlush)window.__uagentFlush(j.fn);else j.fn();j.next+=j.delay;}}clock=end;window.__uagentClock=clock;};
 })();"""
 
 
-_RUNTIME_SCENE_CAPTURE = r"""(() => {
+_RUNTIME_SCENE_CAPTURE = r"""(async () => {
   const elements = [...document.querySelectorAll('body *')].filter(e => !['SCRIPT','STYLE','LINK'].includes(e.tagName));
   const ids = new Map(elements.map((e, i) => [e, i]));
+  const colorCanvas=document.createElement('canvas');colorCanvas.width=colorCanvas.height=1;const colorContext=colorCanvas.getContext('2d');
+  const normalizeColors=value=>value.replace(/(?:oklab|oklch|color)\([^)]*\)/g,token=>{colorContext.clearRect(0,0,1,1);colorContext.fillStyle=token;colorContext.fillRect(0,0,1,1);const p=colorContext.getImageData(0,0,1,1).data;return `rgba(${p[0]}, ${p[1]}, ${p[2]}, ${p[3]/255})`;});
   const fonts = {};
   const chars = new Set([...Array(95)].map((_, i) => String.fromCharCode(i + 32)));
   for (const e of elements) for (const c of e.textContent || '') chars.add(c);
   const glyphFont = (s,e) => {
     const size = parseFloat(s.fontSize), css = `${s.fontWeight} ${s.fontSize} ${s.fontFamily}`;
-    let background='rgb(255,255,255)';for(let p=e;p;p=p.parentElement){const c=getComputedStyle(p).backgroundColor;if(c!=='rgba(0, 0, 0, 0)'&&c!=='transparent'){background=c;break;}}
+    const chain=[];for(let p=e;p;p=p.parentElement)chain.unshift(getComputedStyle(p).backgroundColor);
+    let composed=[255,255,255];for(const c of chain){colorContext.clearRect(0,0,1,1);colorContext.fillStyle=c;colorContext.fillRect(0,0,1,1);const p=colorContext.getImageData(0,0,1,1).data;composed=composed.map((v,i)=>p[i]*p[3]/255+v*(1-p[3]/255));}
+    const background=`rgb(${composed.map(Math.round).join(',')})`;
     const foreground=e.tagName.toLowerCase()==='text'?s.fill:s.color,key=css+'|'+foreground+'|'+background;
     if (fonts[key]) return key;
     const canvas = document.createElement('canvas'); canvas.width = canvas.height = Math.max(96, Math.ceil(size * 4));
@@ -78,9 +82,11 @@ _RUNTIME_SCENE_CAPTURE = r"""(() => {
     const s=getComputedStyle(e), r=e.getBoundingClientRect(), attrs=Object.fromEntries([...e.attributes].map(a=>[a.name,a.value]));
     const textNodes=[...e.childNodes].filter(n=>n.nodeType===3 && n.textContent.trim());
     const texts=textNodes.length?[(()=>{const range=document.createRange();range.setStartBefore(textNodes[0]);range.setEndAfter(textNodes[textNodes.length-1]);return {text:textNodes.map(n=>n.textContent).join(''),rect:box(range.getBoundingClientRect())};})()]:[];
-    const props=['display','visibility','opacity','position','color','backgroundColor','borderRadius','borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth','borderTopColor','borderRightColor','borderBottomColor','borderLeftColor','fontSize','fontWeight','fontFamily','lineHeight','letterSpacing','textAlign','textAnchor','overflowX','overflowY','fill','stroke','strokeWidth','strokeDasharray','strokeDashoffset','strokeLinecap','transform','zIndex'];
+    const props=['display','visibility','opacity','position','color','backgroundColor','borderRadius','borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth','borderTopColor','borderRightColor','borderBottomColor','borderLeftColor','fontSize','fontWeight','fontFamily','lineHeight','letterSpacing','textAlign','textAnchor','overflowX','overflowY','fill','stroke','strokeWidth','strokeDasharray','strokeDashoffset','strokeLinecap','strokeLinejoin','vectorEffect','transform','zIndex'];
     const style=Object.fromEntries(props.map(k=>[k,s[k]]));
-    for(const k of ['transitionProperty','transitionDuration','transitionTimingFunction','boxShadow','textShadow','filter','clipPath','maskImage','backgroundImage'])style[k]=s[k];
+    for(const k of ['transitionProperty','transitionDuration','transitionTimingFunction','boxShadow','textShadow','filter','clipPath','maskImage','backgroundImage','backdropFilter','animationName'])style[k]=s[k];
+    const sourceStyle={...style};
+    for(const k of Object.keys(style))style[k]=normalizeColors(style[k]);
     const native={value:e.value??null,checked:!!e.checked,min:e.min??null,max:e.max??null,step:e.step??null,disabled:!!e.disabled};
     let geometry=null;
     let effect=null;
@@ -89,7 +95,11 @@ _RUNTIME_SCENE_CAPTURE = r"""(() => {
       effect=primitives.length===2&&primitives.includes('fegaussianblur')&&primitives.includes('femerge')&&inputs.length===2&&inputs[1]==='SourceGraphic'&&inputs[0]===blur?.getAttribute('result')&&[null,'SourceGraphic'].includes(blur?.getAttribute('in'))?{kind:'gaussian-merge-glow',sigma:Number(blur.getAttribute('stdDeviation'))}:{kind:'unsupported',primitives};}
     if(typeof e.getTotalLength==='function'){
       try{const length=e.getTotalLength(),matrix=e.getScreenCTM(),count=Math.max(1,Math.min(1024,Math.ceil(length/1.5)));
-        geometry={points:Array.from({length:count+1},(_,i)=>{const p=e.getPointAtLength(length*i/count),q=new DOMPoint(p.x,p.y).matrixTransform(matrix);return [q.x-r.x,q.y-r.y];}),length};
+        const sx=Math.hypot(matrix.a,matrix.b),sy=Math.hypot(matrix.c,matrix.d);
+        geometry={points:Array.from({length:count+1},(_,i)=>{const p=e.getPointAtLength(length*i/count),q=new DOMPoint(p.x,p.y).matrixTransform(matrix);return [q.x-r.x,q.y-r.y];}),length,
+          matrix:[matrix.a,matrix.b,matrix.c,matrix.d,matrix.e,matrix.f],strokeScale:s.vectorEffect==='non-scaling-stroke'?1:sx,
+          uniform:Math.abs(sx-sy)<.0001&&Math.abs(matrix.a*matrix.c+matrix.b*matrix.d)<.0001,
+          subpaths:(attrs.d?.match(/[Mm]/g)||[]).length};
       }catch(error){geometry={error:String(error)};}
     }
     if(e.matches('input[type=range]')) {
@@ -98,8 +108,50 @@ _RUNTIME_SCENE_CAPTURE = r"""(() => {
       for(const sheet of document.styleSheets) {try {scan(sheet.cssRules);} catch {}}
       native.thumb=declarations;
     }
-    return {id:i,parent:ids.get(e.parentElement)??null,tag:e.tagName.toLowerCase(),attrs,rect:box(r),style,texts,font:texts.length?glyphFont(s,e):null,native,geometry,effect,scroll:{x:e.scrollLeft,y:e.scrollTop,width:e.scrollWidth,height:e.scrollHeight,clientWidth:e.clientWidth,clientHeight:e.clientHeight}};
+    return {id:i,parent:ids.get(e.parentElement)??null,tag:e.tagName.toLowerCase(),attrs,rect:box(r),style,sourceStyle,texts,font:texts.length||e.matches('input')?glyphFont(s,e):null,native,geometry,effect,scroll:{x:e.scrollLeft,y:e.scrollTop,width:e.scrollWidth,height:e.scrollHeight,clientWidth:e.clientWidth,clientHeight:e.clientHeight}};
   });
+  // Keep pre-transform layout as a separate piece of evidence. A transformed
+  // bounding box is not the layout rectangle of a rotated keyed item.
+  const neutral=document.createElement('style');neutral.textContent='*{transform:none!important}';document.head.appendChild(neutral);
+  for(const e of elements){const node=nodes[ids.get(e)];node.baseRect=box(e.getBoundingClientRect());
+    const ts=[...e.childNodes].filter(n=>n.nodeType===3&&n.textContent.trim());node.baseTexts=[];
+    if(ts.length){const range=document.createRange();range.setStartBefore(ts[0]);range.setEndAfter(ts[ts.length-1]);node.baseTexts=[{text:ts.map(n=>n.textContent).join(''),rect:box(range.getBoundingClientRect())}];}
+    if(e.localName==='img'&&e.complete&&e.naturalWidth){try{
+      const r=node.baseRect,w=Math.ceil(r.width),h=Math.ceil(r.height);if(w*h>1048576)throw Error('Image pixel budget exceeded');
+      const canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;const ctx=canvas.getContext('2d'),fit=getComputedStyle(e).objectFit;
+      let dw=w,dh=h;if(fit==='cover'||fit==='contain'){const scale=(fit==='cover'?Math.max:Math.min)(w/e.naturalWidth,h/e.naturalHeight);dw=e.naturalWidth*scale;dh=e.naturalHeight*scale;}
+      ctx.drawImage(e,(w-dw)/2,(h-dh)/2,dw,dh);let bytes='';for(const b of ctx.getImageData(0,0,w,h).data)bytes+=String.fromCharCode(b);
+      node.imageAsset={recipe:'source-image-rgba/v1',width:w,height:h,x:Math.floor(r.x+.5),y:Math.floor(r.y+.5),rgba:btoa(bytes),source:e.currentSrc,objectFit:fit};
+    }catch(error){node.imageAssetError=String(error);}}
+  }
+  neutral.remove();
+  // Reuse the authored SVG, including separate subpaths and fractional strokes.
+  // This is a transparent local asset, never a page screenshot. No external
+  // resources, filters or scripts are permitted in this static icon recipe.
+  for(const e of elements.filter(e=>e.localName==='svg'&&!e.ownerSVGElement)) {
+    const node=nodes[ids.get(e)],r=e.getBoundingClientRect(),all=[e,...e.querySelectorAll('*')];
+    const allowed=new Set(['svg','g','path','circle','ellipse','rect','line','polyline','polygon','title','desc','defs','pattern','text','tspan']);
+    if(all.some(n=>!allowed.has(n.localName)||[...n.attributes].some(a=>/^on/i.test(a.name))||['filter','clipPath','maskImage'].some(k=>!['none',''].includes(getComputedStyle(n)[k]||''))))continue;
+    if(r.width<=0||r.height<=0||r.width*r.height>262144||getComputedStyle(e).transform!=='none')continue;
+    try {
+      const clone=e.cloneNode(true),copies=[clone,...clone.querySelectorAll('*')];
+      const props=['fill','fill-opacity','fill-rule','stroke','stroke-opacity','stroke-width','stroke-linecap','stroke-linejoin','stroke-miterlimit','stroke-dasharray','stroke-dashoffset','vector-effect','color','opacity','display','visibility','overflow','transform','transform-origin','transform-box','font-family','font-size','font-weight','font-style','letter-spacing','text-anchor'];
+      all.forEach((original,i)=>{const cs=getComputedStyle(original),copy=copies[i];copy.removeAttribute('class');copy.removeAttribute('style');for(const key of props)copy.style.setProperty(key,cs.getPropertyValue(key));});
+      clone.setAttribute('xmlns','http://www.w3.org/2000/svg');clone.setAttribute('width',String(r.width));clone.setAttribute('height',String(r.height));clone.style.opacity='1';
+      const left=Math.floor(r.x+.5),top=Math.floor(r.y+.5),w=Math.ceil(r.width),h=Math.ceil(r.height);
+      // The browser snaps an outer CSS SVG viewport to device pixels (DPR=1).
+      // Retain fractional internal path coordinates, not fractional placement
+      // of the already-rasterized viewport. See the half-pixel SVG fixture.
+      const wrapper=document.createElementNS('http://www.w3.org/2000/svg','svg');wrapper.setAttribute('width',w);wrapper.setAttribute('height',h);
+      clone.setAttribute('x',0);clone.setAttribute('y',0);wrapper.appendChild(clone);
+      const xml=new XMLSerializer().serializeToString(wrapper),url=URL.createObjectURL(new Blob([xml],{type:'image/svg+xml'})),img=new Image();
+      try {await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('SVG decode timeout')),3000);img.onload=()=>{clearTimeout(timer);resolve();};img.onerror=()=>{clearTimeout(timer);reject(Error('SVG decode failed'));};img.src=url;});
+        const canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;const ctx=canvas.getContext('2d');ctx.drawImage(img,0,0);
+        const pixels=ctx.getImageData(0,0,w,h).data;let bytes='';for(const b of pixels)bytes+=String.fromCharCode(b);
+        node.svgAsset={recipe:'source-svg-rgba/v1',width:w,height:h,x:left,y:top,rgba:btoa(bytes),svg:xml};
+      }finally{URL.revokeObjectURL(url);}
+    }catch(error){node.svgAssetError=String(error);}
+  }
   const freeze=document.createElement('style'); freeze.textContent='*{transition:none!important}';document.head.appendChild(freeze);
   for(const e of elements.filter(e=>e.matches('input[type=checkbox]'))) {
     const saved=e.checked, node=nodes[ids.get(e)]; node.native.paintStates={};
@@ -114,7 +166,7 @@ _RUNTIME_SCENE_CAPTURE = r"""(() => {
   const scanAnimations=rules=>{for(const rule of rules||[]){if(rule.type===CSSRule.KEYFRAMES_RULE){keyframes[rule.name]=[...rule.cssRules].map(k=>({offset:k.keyText,opacity:k.style.opacity}));}else{if(rule.style?.animationName&&rule.style.animationName!=='none')animationRules.push(rule);if(rule.cssRules)scanAnimations(rule.cssRules);}}};
   for(const sheet of document.styleSheets){try{scanAnimations(sheet.cssRules);}catch{}}
   for(const rule of animationRules)if(/^\.[\w-]+$/.test(rule.selectorText))animations[rule.selectorText.slice(1)]={duration:rule.style.animationDuration,easing:rule.style.animationTimingFunction,iterations:rule.style.animationIterationCount,frames:keyframes[rule.style.animationName]||[]};
-  return {schema:'uagent.runtime-scene/v1',viewport:{width:innerWidth,height:innerHeight},nodes,fonts,animations,testClock:window.__uagentClock??null,logicalState:window.__uagentState??null};
+  return {schema:'uagent.runtime-scene/v1',viewport:{width:innerWidth,height:innerHeight},nodes,fonts,animations,instances:window.__uagentInstances??null,testClock:window.__uagentClock??null,logicalState:window.__uagentState??null};
 })()"""
 
 
@@ -618,6 +670,8 @@ def capture_layout(source_dir: Path, *, viewport: tuple[int, int] = (1024, 600),
             def evaluate_value(source: str, *, await_promise: bool = False) -> Any:
                 reply = cdp.call("Runtime.evaluate", {"expression": source, "returnByValue": True,
                                                        "awaitPromise": await_promise})
+                if reply.get('error') or reply.get('result',{}).get('exceptionDetails'):
+                    raise RuntimeError(str(reply.get('error') or reply['result']['exceptionDetails'])[:1200])
                 result = reply.get("result", {}).get("result", {})
                 if result.get("subtype") == "error" or "description" in result and result.get("type") == "object":
                     raise RuntimeError(result.get("description", "Runtime.evaluate failed"))
@@ -650,7 +704,7 @@ def capture_layout(source_dir: Path, *, viewport: tuple[int, int] = (1024, 600),
                     node['identity_confidence'] = 1.0 if attrs.get('data-openhmi-id') else (0.95 if attrs.get('data-figma-node-id') else (0.85 if attrs.get('id') else 0.25))
                 # Preserve paint and control metadata omitted by the legacy
                 # semantic sampler, including zero-sized checkbox inputs.
-                runtime = evaluate_value(_RUNTIME_SCENE_CAPTURE)
+                runtime = evaluate_value(_RUNTIME_SCENE_CAPTURE, await_promise=True)
                 if isinstance(runtime, dict):
                     snapshot['runtime_scene'] = runtime
                 return snapshot

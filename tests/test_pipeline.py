@@ -148,6 +148,279 @@ def test_runtime_scene_retains_unsupported_nodes_and_blocks_incomplete_export():
     assert '#define UAGENT_RUNTIME_OWNS_SCENE 1' in result.custom_h
 
 
+def _svg_scene(nodes, contract=None):
+    from types import SimpleNamespace
+    from generator.lvgl import runtime_scene_bundle
+    model=SimpleNamespace(browser_evidence={'screens':[{'state':'home','data':{'runtime_scene':{
+        'schema':'uagent.runtime-scene/v1','viewport':{'width':80,'height':80},'nodes':nodes,'fonts':{}}}}]})
+    return runtime_scene_bundle(model,{'reactive_contract':contract or {}})
+
+
+def _svg_node(index, tag, parent=None):
+    return {'id':index,'parent':parent,'tag':tag,'attrs':{},'texts':[],
+            'rect':{'x':10,'y':10,'width':20,'height':20},
+            'style':{'display':'block','visibility':'visible','overflowX':'visible','overflowY':'visible',
+                     'opacity':'1','backgroundColor':'transparent','borderRadius':'0','fill':'none',
+                     'stroke':'rgb(0, 128, 255)','strokeWidth':'2','strokeLinecap':'round'}}
+
+
+def test_svg_original_asset_retains_children_and_reuses_pixels():
+    import base64
+    root=_svg_node(0,'svg');child=_svg_node(1,'path',0)
+    root['svgAsset']={'recipe':'source-svg-rgba/v1','width':1,'height':1,'x':10,'y':10,
+                      'rgba':base64.b64encode(bytes([17,34,51,128])).decode()}
+    other=_svg_node(2,'svg');other['svgAsset']=dict(root['svgAsset'])
+    result=_svg_scene([root,child,other])
+    assert not result.screen_tree['runtime_scene']['blockers']
+    assert len(result.units)==3  # Asset conversion must not drop source elements.
+    assert 'original SVG element retained' in result.units[1].decisions['reason']
+    assert result.custom_c.count('static const lv_image_dsc_t runtime_svg_')==1
+    assert '51,34,17,128' in result.custom_c  # Explicit RGBA -> BGRA, including alpha.
+    assert result.custom_c.count('lv_image_set_src(')==2
+
+
+def test_svg_mutable_view_does_not_freeze_to_asset():
+    root=_svg_node(0,'svg');root['attrs']={'data-uagent-source':'App.tsx:1'}
+    root['svgAsset']={'width':0}  # Must never be consumed for a dynamic view.
+    result=_svg_scene([root],{'views':[{'source_id':'App.tsx:1','identity':'shape','children':[]}]})
+    assert 'lv_image_set_src(' not in result.custom_c
+
+
+def test_svg_circle_uses_screen_transform_and_source_dash_units():
+    circle=_svg_node(0,'circle');circle['attrs']={'cx':'12','cy':'12','r':'3'}
+    circle['geometry']={'matrix':[2,0,0,2,5,7],'strokeScale':2,'uniform':True}
+    circle['style']['strokeDasharray']='9.42477796076938'
+    result=_svg_scene([circle])
+    assert 'lv_obj_set_pos(runtime_0_0,21,23)' in result.custom_c
+    assert 'lv_obj_set_size(runtime_0_0,16,16)' in result.custom_c
+    assert 'lv_arc_set_angles(runtime_0_0,0,180)' in result.custom_c
+    assert 'lv_obj_set_style_arc_width(runtime_0_0,4' in result.custom_c
+
+
+def test_svg_compound_mutable_path_is_blocked_instead_of_joined_silently():
+    path=_svg_node(0,'path');path['geometry']={'points':[[0,0],[2,2],[10,10]],'subpaths':2}
+    result=_svg_scene([path])
+    assert any('multiple subpaths' in b for b in result.screen_tree['runtime_scene']['blockers'])
+
+
+def test_svg_corrupt_asset_is_rejected():
+    import pytest
+    root=_svg_node(0,'svg');root['svgAsset']={'width':2,'height':2,'rgba':'AAAA'}
+    with pytest.raises(ValueError,match='Invalid source SVG asset'):_svg_scene([root])
+
+
+def test_svg_local_quality_gate_detects_missing_icon_despite_page_score():
+    from PIL import Image, ImageDraw
+    from tools.runtime_convert import ssim, svg_region_scores
+    reference=Image.new('RGB',(320,240),'white');actual=reference.copy()
+    ImageDraw.Draw(reference).ellipse((20,20,35,35),outline='black',width=3)
+    assert ssim(reference,actual)>.90
+    scores=svg_region_scores(reference,actual,[{'node':'icon','rect':[18,18,20,20]}])
+    assert not scores[0]['passed']
+
+
+def test_nested_state_binding_reports_blocker_instead_of_crashing(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract
+    parser=Path(r'D:\aiassit\meter\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('function App(){const [{deep:{page}},setPage]=useState([{deep:{page:0}}]);return <div/>;}',encoding='utf-8')
+    result=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser)
+    assert any('state destructuring recipe' in b for b in result['blockers'])
+    assert result['states']==[]
+
+
+def test_updater_locals_are_evaluated_once_before_commit(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract, resolve_actions
+    parser=Path(r'D:\aiassit\meter\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('''function App(){const [count,setCount]=useState(1);
+      const tick=()=>setCount(previous=>{const delta=Math.random();const twice=delta+delta;return previous+twice;});
+      return <button onClick={tick}/>;}''',encoding='utf-8')
+    contract=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser)
+    actions=resolve_actions(['id','tick'],contract)
+    assert len(actions[0]['bindings'])==2
+    assert actions[0]['bindings'][1]['value']==['binary','+',['local','updater_0'],['local','updater_0']]
+    contract['timers']=[{'period':['literal',100],'actions':actions}]
+    result=_svg_scene([],contract)
+    assert not result.screen_tree['runtime_scene']['blockers']
+    assert result.custom_c.count('double runtime_local_updater_0=runtime_random();')==1
+    assert 'runtime_local_updater_0 + runtime_local_updater_0' in result.custom_c
+
+
+def test_interval_extraction_preserves_event_owned_lifecycle(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract
+    parser=Path(r'D:\aiassit\meter\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('''function App(){const [value,setValue]=useState(0);
+      useEffect(()=>{const id=setInterval(()=>setValue(1),100);return()=>clearInterval(id);},[]);
+      const upload=()=>{setInterval(()=>setValue(2),200);};return <button onClick={upload}/>;}''',encoding='utf-8')
+    contract=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser)
+    assert [t['effectOwned'] for t in contract['timers']]==[True,False]
+
+
+def test_parameterized_dynamic_views_have_source_callsites(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract, source_view_bindings
+    parser=Path(r'D:\aiassit\meter\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('''function Dial({value,hidden=false}){const doubled=value*2;return hidden?<b>Hidden</b>:<span>{doubled}</span>;}
+      function App(){const [left,setLeft]=useState(1);const [right,setRight]=useState(2);return <div><Dial value={left}/><Dial value={right}/><Dial value={right} hidden={true}/></div>;}''',encoding='utf-8')
+    contract=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser)
+    views=[v for v in source_view_bindings(contract) if v.get('callsite')]
+    assert len(views)==2 and len({v['callsite'] for v in views})==2
+    assert views[0]['source_id']==views[1]['source_id']
+    assert [v['children'][0]['texts'][0][2] for v in views]==[['id','left'],['id','right']]
+
+
+def test_explicit_list_capacity_rejects_overflow_and_ambiguous_empty_type():
+    import pytest
+    state={'name':'items','initial':['array',[['literal',1],['literal',2]]],'owner':'App'}
+    result=_svg_scene([],{'states':[state],'list_capacity':2})
+    assert not result.screen_tree['runtime_scene']['blockers']
+    assert '#define UAGENT_LIST_CAPACITY 2' in result.custom_c
+    assert 'a.count>=UAGENT_LIST_CAPACITY' in result.custom_c
+    assert _svg_scene([],{'states':[state],'list_capacity':1}).screen_tree['runtime_scene']['blockers']
+    assert _svg_scene([],{'states':[{**state,'initial':['array',[]]}]}).screen_tree['runtime_scene']['blockers']
+    for capacity in [0,1025,True]:
+        with pytest.raises(ValueError,match='List capacity'):_svg_scene([],{'list_capacity':capacity})
+
+
+def test_numeric_tuple_state_and_permutation_compile(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract
+    from generator.lvgl import _runtime_expression, _runtime_string
+    parser=Path(r'D:\aiassit\meter\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('function App(){const [[page,direction],setPage]=useState([0,0]);return <div/>;}',encoding='utf-8')
+    contract=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser)
+    assert not contract['blockers']
+    assert contract['constants']['page'][0]=='member'
+    state=contract['states'][0]['name']
+    element=['member',['id',state],['literal',1]]
+    assert not _runtime_string(element,contract)
+    assert 'runtime_num_get' in _runtime_expression(element,contract)
+    assert 'runtime_num_append' in _runtime_expression(['array',[element,['literal',3]]],contract)
+
+
+def test_pointer_lowering_keeps_instance_state_and_early_return(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract
+    from core.pointer_model import expand_pointer_instances, reduce_expression, value_ast
+    parser=Path(r'D:\aiassit\meter\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('''function Follow({bias=0}){
+      const ref=useRef(null);const [position,setPosition]=useState({x:0,y:0});
+      useEffect(()=>{setPosition({x:bias,y:0});},[bias]);
+      useEffect(()=>{const move=e=>{if(!ref.current)return;const r=ref.current.getBoundingClientRect();let x=e.clientX-r.left;
+        if(x<1){setPosition({x:bias,y:0});return;}x+=bias;setPosition({x:x,y:e.clientY-r.top});};
+        window.addEventListener("mousemove",move);return()=>window.removeEventListener("mousemove",move);},[bias]);
+      return <div ref={ref}/>;}''',encoding='utf-8')
+    contract=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser)
+    scene={'instances':{'left':{'owner':'Follow','props':{'bias':-3}},'right':{'owner':'Follow','props':{'bias':7}}},'nodes':[
+      {'id':i,'attrs':{'data-uagent-instance':identity,'data-uagent-ref':'ref'},'rect':{'x':i*100+.25,'y':20,'width':50,'height':50}}
+      for i,identity in enumerate(('left','right'))]}
+    lowered=expand_pointer_instances(contract,[scene])
+    assert not lowered['blockers']
+    assert [s['name'] for s in lowered['states']]==['left:position','right:position']
+    def evaluate(expr):
+        if not isinstance(expr,list):return expr
+        if expr and expr[0]=='pointer':return ['literal',0]
+        if expr and expr[0]=='layout':return ['literal',100 if expr[2]=='left' else 20]
+        return [evaluate(e) for e in expr]
+    for pointer,bias in zip(lowered['pointers'],(-3,7)):
+        x=next(a for a in pointer['actions'] if a['field']=='x')
+        assert reduce_expression(evaluate(x['value']),{pointer['instance']+':position':value_ast({'x':0,'y':0})})==['literal',bias]
+    assert lowered['layout_offsets']['0']['left']==.25
+
+
+def test_keyed_gesture_threshold_permutation_and_control_coverage(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract, literal
+    from core.pointer_model import expand_pointer_instances, reduce_expression, value_ast
+    parser=Path(r'D:\aiassit\meter\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('''const Stack=()=>{const [indices,setIndices]=useState([0,1,2,3]);
+      const rotate=()=>setIndices(previous=>[previous[1],previous[2],previous[3],previous[0]]);
+      return <div><button onClick={()=>rotate()}/>{indices.map((index,i)=><motion.div key={index} onDragEnd={(e,{offset,velocity})=>{
+        const power=Math.abs(offset.x)*velocity.x;if(power < -10000 || power > 10000)rotate();}}/>)}</div>;};''',encoding='utf-8')
+    contract=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser)
+    gesture=contract['gestures'][0]
+    nodes=[{'id':i,'attrs':{'data-uagent-instance':'one','data-uagent-source':gesture['source_id'],'data-uagent-key':str(i)},
+            'rect':{'x':0,'y':0,'width':100,'height':100}} for i in range(4)]
+    scene={'instances':{'one':{'owner':'Stack','props':{}}},'nodes':nodes}
+    lowered=expand_pointer_instances(contract,[scene]);keyed=lowered['keyed_lists'][0]
+    assert keyed['nodes']==[0,1,2,3]
+    assert any('onClick requires an instance-scoped' in b for b in lowered['blockers'])
+    assert not any('onDragEnd requires' in b for b in lowered['blockers'])
+    def release(order,dx,vx):
+        def replace(v):
+            if not isinstance(v,list):return v
+            if v and v[0]=='gesture':return ['literal',dx if v[1]=='offset' else vx]
+            return [replace(x) for x in v]
+        return literal(reduce_expression(replace(keyed['actions'][0]['value']),{'one:indices':value_ast(order)}))
+    for dx,vx in [(0,1000),(100,0),(100,100),(100,-100)]:assert release([0,1,2,3],dx,vx)==[0,1,2,3]
+    for dx,vx in [(100,101),(-100,-101)]:assert release([0,1,2,3],dx,vx)==[1,2,3,0]
+    order=[0,1,2,3]
+    for _ in range(4):order=release(order,100,101)
+    assert order==[0,1,2,3]
+    nodes[-1]['attrs']['data-uagent-key']='0'
+    with pytest.raises(ValueError,match='duplicated'):expand_pointer_instances(contract,[scene])
+
+
+def test_uncompiled_pointer_listeners_and_drag_handlers_are_not_silent(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract
+    parser=Path(r'D:\aiassit\meter\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('''function App(){useEffect(()=>{window.addEventListener("mousemove",move);},[]);
+      return <motion.div onDragEnd={end}/>;}''',encoding='utf-8')
+    result=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser)
+    assert any('subscription/lifecycle' in b for b in result['blockers'])
+    assert any('onDragEnd' in b for b in result['blockers'])
+
+
+def test_original_svg_asset_matches_browser_at_half_pixel_origin(tmp_path):
+    import base64, json, subprocess, time
+    import pytest
+    from io import BytesIO
+    from PIL import Image
+    from core import browser_layout as browser
+    from tools.runtime_convert import ssim
+    binary=browser._browser()
+    if not binary:pytest.skip('Local Chromium required for SVG raster regression')
+    port=browser._free_port();cdp=None
+    process=subprocess.Popen([binary,'--headless=new','--no-first-run','--disable-gpu','--remote-allow-origins=*',
+        f'--remote-debugging-port={port}',f'--user-data-dir={tmp_path / "browser"}','about:blank'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(100):
+            try:targets=json.load(browser._DIRECT.open(f'http://127.0.0.1:{port}/json/list'));break
+            except OSError:time.sleep(.1)
+        else:pytest.fail('Local SVG fixture browser did not start')
+        cdp=browser._CDP(next(t['webSocketDebuggerUrl'] for t in targets if t['type']=='page'))
+        cdp.call('Page.enable')
+        cdp.call('Emulation.setDeviceMetricsOverride',{'width':80,'height':60,'deviceScaleFactor':1,'mobile':False})
+        html='''<style>body{margin:0;background:white}</style><svg width="24" height="24" viewBox="0 0 12 12"
+          style="position:absolute;left:10.5px;top:10.5px;display:block" fill="none" stroke="#0080ff" stroke-width="1.25" stroke-linecap="round">
+          <path d="M1 1L4 4 M8 1L11 4"/><circle cx="6" cy="8" r="2"/></svg>'''
+        cdp.call('Runtime.evaluate',{'expression':'document.body.innerHTML='+json.dumps(html)})
+        cdp.call('Runtime.evaluate',{'expression':'new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))','awaitPromise':True})
+        reference=Image.open(BytesIO(base64.b64decode(cdp.call('Page.captureScreenshot',{'format':'png'})['result']['data'])))
+        result=cdp.call('Runtime.evaluate',{'expression':browser._RUNTIME_SCENE_CAPTURE,'returnByValue':True,'awaitPromise':True})
+        scene=result['result']['result']['value'];asset=next(n['svgAsset'] for n in scene['nodes'] if n.get('svgAsset'))
+        rendered=Image.new('RGBA',reference.size,'white')
+        rendered.alpha_composite(Image.frombytes('RGBA',(asset['width'],asset['height']),base64.b64decode(asset['rgba'])),(asset['x'],asset['y']))
+        assert ssim(reference.crop((10,10,36,36)),rendered.crop((10,10,36,36)))>=.98
+        path=next(n for n in scene['nodes'] if n['tag']=='path')
+        assert path['geometry']['subpaths']==2
+        assert path['geometry']['strokeScale']==2
+    finally:
+        if cdp:cdp.close()
+        process.terminate();process.wait(timeout=10)
+
+
 def test_runtime_harness_does_not_replay_the_snapshot_or_infer_canvas_from_children(tmp_path):
     from tools.cross_validate import generate_snapshot_harness
     custom=tmp_path/'ui_builder/custom';custom.mkdir(parents=True)
@@ -204,6 +477,52 @@ def test_runtime_computed_paint_recipes_and_js_rounding():
     assert _runtime_expression(['call',['member',['id','Math'],['literal','round']],[['literal',-1.5]]],{})=='floor((-1.5)+0.5)'
 
 
+def test_sdl_capture_waits_for_a_later_completed_frame(tmp_path,monkeypatch):
+    import os
+    from PIL import Image
+    from tools import runtime_convert as converter
+    clock=[0.0];target=tmp_path/'sdl.bmp'
+    class Process:
+        def __init__(self,*args,**kwargs):
+            Image.new('RGB',(4,4),'black').save(target)
+            os.utime(target,ns=(1000000000,1000000000))
+            (tmp_path/'sdl-state.json').write_text('{}')
+        def poll(self):return None
+        def terminate(self):pass
+        def wait(self,timeout):return 0
+    def sleep(seconds):
+        clock[0]+=seconds
+        if clock[0]>=2 and target.stat().st_mtime_ns==1000000000:
+            Image.new('RGB',(4,4),'white').save(target)
+            os.utime(target,ns=(2000000000,2000000000))
+    monkeypatch.setattr(converter.subprocess,'Popen',Process)
+    monkeypatch.setattr(converter.time,'monotonic',lambda:clock[0])
+    monkeypatch.setattr(converter.time,'sleep',sleep)
+    path=converter.capture_sdl(tmp_path/'mock.exe',tmp_path,0)
+    assert clock[0]>=3
+    with Image.open(path) as actual:assert actual.getpixel((0,0))==(255,255,255)
+
+
+def test_missing_make_host_entry_preserves_application_and_existing_html(tmp_path):
+    from tools.runtime_convert import prepare_browser_entry
+    import pytest
+    app=tmp_path/'src/app/App.tsx';app.parent.mkdir(parents=True)
+    app.write_text('export default function App(){return <div/>}',encoding='utf-8')
+    styles=tmp_path/'src/styles/index.css';styles.parent.mkdir();styles.write_text('body{margin:0}',encoding='utf-8')
+    before=app.read_bytes()
+    assert prepare_browser_entry(tmp_path)
+    assert app.read_bytes()==before
+    assert "import './src/styles/index.css'" in (tmp_path/'uagent-browser-entry.tsx').read_text()
+    (tmp_path/'index.html').write_text('custom host',encoding='utf-8')
+    assert not prepare_browser_entry(tmp_path)
+    assert (tmp_path/'index.html').read_text()=='custom host'
+    other=tmp_path/'ambiguous';(other/'src/app').mkdir(parents=True)
+    (other/'src/App.tsx').write_text('export default 1')
+    (other/'src/app/App.tsx').write_text('export default 2')
+    with pytest.raises(ValueError,match='ambiguous'):prepare_browser_entry(other)
+    assert not (other/'index.html').exists()
+
+
 def test_conversion_rejects_source_output_alias_without_writing(tmp_path):
     import pytest
     from tools.runtime_convert import convert
@@ -234,3 +553,218 @@ def test_effect_completeness_requires_source_bound_classified_node():
     runtime['blockers']=['0:4: unknown filter primitive']
     blocked=deepcopy(plan);_merge_runtime_effect_decisions(blocked,runtime,captures,{'jsx':[{'file':'App.tsx','start':10}]})
     assert blocked['blockers']==plan['blockers']
+
+
+def test_interaction_probe_is_visible_coverage_not_history_equivalence():
+    from copy import deepcopy
+    from tools.interaction_probe import visible_signature, node_delta
+    first={'state':{'history':['home']},'nodes':[{'source':'App.tsx:1','tag':'button','text':'Open'}],'controls':[]}
+    history=deepcopy(first);history['state']['history'].append('home')
+    assert visible_signature(first)==visible_signature(history)
+    changed=deepcopy(history);changed['nodes'].append({'source':'App.tsx:2','tag':'svg','text':''})
+    assert visible_signature(first)!=visible_signature(changed)
+    assert node_delta(first,changed)=={'added':1,'removed':0}
+    assert node_delta(changed,first)=={'added':0,'removed':1}
+
+
+def test_interaction_probe_records_clipped_controls_and_native_input_samples():
+    from tools.interaction_probe import candidates
+    base={'source':'App.tsx:1','ordinal':0,'index':0,'label':'Date','in_view':False,
+          'rendered':True,'disabled':False,'tag':'input','type':'date','min':'','max':''}
+    actions=candidates({'controls':[base,{**base,'disabled':True},{**base,'rendered':False}]})
+    assert len(actions)==1 and actions[0]['kind']=='input'
+    assert actions[0]['value']=='2030-02-14' and not actions[0]['in_view']
+
+
+def test_runtime_conversion_stops_before_build_when_capability_gate_fails(tmp_path,monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from tools import runtime_convert as converter
+    source=tmp_path/'input';source.mkdir()
+    output=tmp_path/'output';staging=output/'source';staging.mkdir(parents=True)
+    (staging/'package.json').write_text('{}',encoding='utf-8')
+    (output/'source-sha256.json').write_text('{}',encoding='utf-8')
+    (output/'browser-reference.json').write_text(json.dumps({'uagent_run':{'width':320,'height':240,'sample_ms':0,'production':True}}),encoding='utf-8')
+    monkeypatch.setattr(converter.browser_layout,'_vite_runtime_works',lambda *a,**k:True)
+    monkeypatch.setattr(converter,'analyze',lambda *a:None)
+    bundle=SimpleNamespace(screen_tree={'runtime_scene':{'blockers':['Unsupported history stack']}},agent_planning={'blockers':[]},warnings=[])
+    monkeypatch.setattr(converter,'compile_lvgl',lambda *a:bundle)
+    monkeypatch.setattr(converter,'write_aibuilder_custom',lambda *a,**k:{})
+    def forbidden(*a,**k):raise AssertionError('Blocked code must not be built')
+    monkeypatch.setattr(converter,'_build_snapshot_simulator',forbidden)
+    monkeypatch.setattr(converter,'generate_snapshot_harness',forbidden)
+    result=converter.convert(source,output,320,240,resume=True,sample_ms=0)
+    assert result['status']=='blocked' and not result['accepted']
+    assert result['blockers']==['Unsupported history stack']
+
+
+def test_source_navigation_stack_and_loop_callbacks(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract, source_control_bindings
+    from generator.lvgl import _runtime_expression, _runtime_text_format
+    parser=Path(r'D:\uiagent_oct\print-baseline-20261001\source\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('''function Menu({onOpen}){
+      const entries=[{page:"alpha"},{page:"beta"}];
+      return <div>{entries.map(entry=><button onClick={()=>onOpen(entry.page)}><span>{entry.page}</span></button>)}</div>;
+    }
+    function App(){const [route,setRoute]=useState("home");const [trail,setTrail]=useState(["home"]);
+      const open=page=>{setRoute(page);setTrail([...trail,page]);};
+      const back=()=>{if(trail.length>1){const copy=[...trail];copy.pop();setRoute(copy[copy.length-1]);setTrail(copy);}else{setRoute("home");setTrail(["home"]);}};
+      const render=()=>{switch(route){case "alpha":return <Alpha/>;case "beta":return <Beta/>;default:return <Menu onOpen={open}/>;}};
+      return <div><button aria-label="Previous" onClick={back}/>{render()}</div>;
+    }''',encoding='utf-8')
+    c=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser);bindings=source_control_bindings(c)
+    assert not any(b.get('blocker') for b in bindings)
+    assert c['navigation'][0]['state']=='route'
+    links=[b for b in bindings if b['owner']=='Menu']
+    assert len(links)==2 and [b['ordinal'] for b in links]==[0,1]
+    assert [b['actions'][0]['value'] for b in links]==[['literal','alpha'],['literal','beta']]
+    back=next(b for b in bindings if b['identity']=='Previous')
+    route=next(a['value'] for a in back['actions'] if a['state']=='route')
+    assert _runtime_text_format([route],c)[0]=='%s'
+    assert 'runtime_array_get(runtime_array_drop(runtime_state_trail)' in _runtime_expression(route,c)
+
+
+def test_native_text_event_and_unsupported_array_element(tmp_path):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract, source_control_bindings
+    from generator.lvgl import _runtime_expression
+    parser=Path(r'D:\uiagent_oct\print-baseline-20261001\source\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text('''function App(){const [day,setDay]=useState("2025-01-01");
+      const change=e=>setDay(e.target.value);return <input type="date" value={day} onChange={change}/>;}''',encoding='utf-8')
+    c=extract_reactive_contract(tmp_path,['App.tsx'],parser_module=parser)
+    assert source_control_bindings(c)[0]['actions']==[{'state':'day','field':None,'value':['event-text']}]
+    with pytest.raises(ValueError,match='require strings'):_runtime_expression(['array',[['literal',{}]]],c)
+
+
+def _extract_rules_fixture(tmp_path, source):
+    import pytest
+    from core.reactive_contract import extract_reactive_contract
+    parser = Path(r'D:\uiagent_oct\print-baseline-20261001\source\node_modules\typescript\lib\typescript.js')
+    if not parser.is_file():
+        pytest.skip('Existing local TypeScript parser required')
+    (tmp_path/'App.tsx').write_text(source, encoding='utf-8')
+    return extract_reactive_contract(tmp_path, ['App.tsx'], parser_module=parser)
+
+
+def test_scoped_rules_preserve_same_named_component_states_and_handlers(tmp_path):
+    from core.state_rules import compile_state_rules
+    contract = _extract_rules_fixture(tmp_path, '''
+      function First(){const [activeTab,setActiveTab]=useState('one');
+        const reset=()=>setActiveTab('one');return <button onClick={reset}/>;}
+      function Second(){const [activeTab,setActiveTab]=useState('two');
+        const reset=()=>setActiveTab('two');return <button onClick={reset}/>;}
+      function App(){return <><First/><Second/></>;}
+    ''')
+    rules = compile_state_rules(contract)
+    first, second = rules['components'][:2]
+    assert first['states'][0]['id'] != second['states'][0]['id']
+    assert [c['states'][0]['initial_value'] for c in (first, second)] == ['one', 'two']
+    assert first['functions'][1]['id'] != second['functions'][1]['id']
+    # The legacy backend must still block, not flatten these two instances.
+    assert any('duplicate state' in b for b in contract['blockers'])
+    assert rules['summary']['target_execution'] == 'legacy-backend-gated'
+
+
+def test_typed_empty_records_nested_lists_and_explicit_capacity(tmp_path):
+    import pytest
+    from copy import deepcopy
+    from core.state_rules import compile_state_rules, validate_value, RuleError
+    contract = _extract_rules_fixture(tmp_path, '''
+      interface Row {id:number; title:string; options:string[]; selected?:boolean;}
+      function App(){const [rows,setRows]=useState<Row[]>([]);
+        return <div>{rows.map(row=><button key={row.id}>{row.title}</button>)}</div>;}
+    ''')
+    rules = compile_state_rules(contract, 2)
+    assert rules['blockers'] == []
+    component = rules['components'][0]
+    schema = component['states'][0]['type']
+    assert schema['element']['fields']['options']['capacity'] == 2
+    rows = [{'id': 1, 'title': 'Alpha', 'options': ['yes', 'no']}]
+    original = deepcopy(rows)
+    validate_value(schema, rows)
+    with pytest.raises(RuleError, match='list capacity 2 exceeded'):
+        validate_value(schema, [*rows, *rows, *rows])
+    with pytest.raises(RuleError, match='unknown fields'):
+        validate_value(schema, [{**rows[0], 'lost': 1}])
+    with pytest.raises(RuleError, match='number'):
+        validate_value(schema, [{**rows[0], 'id': True}])
+    assert rows == original
+    assert component['loops'][0]['key'] == ['member', ['id', 'row'], ['literal', 'id']]
+
+
+def test_rules_reject_unknown_initializers_and_recursive_or_ambiguous_lists(tmp_path):
+    from core.state_rules import compile_state_rules
+    contract = _extract_rules_fixture(tmp_path, '''
+      interface Recursive {children: Recursive[]}
+      function App(){const [a,setA]=useState([]);
+        const [b,setB]=useState<Recursive[]>([]);
+        const [c,setC]=useState(loadData());return <div/>;}
+    ''')
+    rules = compile_state_rules(contract)
+    assert rules['summary']['typed_states'] == 0
+    assert any('empty list' in b for b in rules['blockers'])
+    assert any('recursive' in b for b in rules['blockers'])
+    assert any('requires lowering' in b for b in rules['blockers'])
+
+
+def test_rules_retain_timeout_origin_and_custom_control_events(tmp_path):
+    from core.state_rules import compile_state_rules
+    contract = _extract_rules_fixture(tmp_path, '''
+      function App(){const [value,setValue]=useState('');
+        useEffect(()=>{const t=setTimeout(()=>setValue('ready'),10);return()=>clearTimeout(t);},[]);
+        const upload=()=>{setTimeout(()=>setValue('done'),20);alert('queued');};
+        return <Select value={value} onValueChange={setValue} onOpenChange={upload}/>;}
+    ''')
+    rules = compile_state_rules(contract)
+    assert [(t['kind'], t['trigger']) for t in rules['tasks']] == [('timeout', 'effect'), ('timeout', 'call')]
+    assert rules['tasks'][0]['scope'] != rules['tasks'][1]['scope']
+    assert [e['event'] for e in rules['components'][0]['events']] == ['onValueChange', 'onOpenChange']
+    assert rules['summary']['host_calls'] == 1
+
+
+def test_batched_functional_updates_consume_queue_but_direct_reads_do_not(tmp_path):
+    import pytest
+    from core.reactive_contract import resolve_actions
+    from generator.lvgl import _runtime_expression
+    c = _extract_rules_fixture(tmp_path, '''function App(){const [n,setN]=useState(0);
+      const twice=()=>{setN(p=>p+1);setN(p=>p+1);};
+      const replace=()=>{setN(p=>p+1);setN(n+1);};
+      const locals=()=>{setN(p=>{const a=p+1;return a;});setN(p=>{const b=p+1;return b;});};
+      const impure=()=>{setN(Math.random());setN(p=>p+p);};
+      return <div/>;}''')
+    twice = resolve_actions(['id', 'twice'], c)
+    replace = resolve_actions(['id', 'replace'], c)
+    assert _runtime_expression(twice[0]['value'], c).count(' + 1') == 2
+    assert _runtime_expression(replace[0]['value'], c).count(' + 1') == 1
+    actions = resolve_actions(['id', 'locals'], c)
+    assert len(actions[0]['bindings']) == 2
+    assert actions[0]['bindings'][1]['value'][2] == ['local', 'updater_0']
+    with pytest.raises(ValueError, match='repeated evaluation'):
+        resolve_actions(['id', 'impure'], c)
+
+
+def test_state_rules_reject_utf8_overflow_instead_of_silent_string_truncation():
+    import pytest
+    from core.state_rules import validate_value, RuleError
+    schema = {'kind': 'string', 'capacity_bytes': 4}
+    validate_value(schema, '中a')
+    with pytest.raises(RuleError, match='capacity'):
+        validate_value(schema, '中文')
+    with pytest.raises(RuleError, match='NUL'):
+        validate_value(schema, 'a\0b')
+
+
+def test_queued_record_updates_keep_prior_fields_and_render_snapshot(tmp_path):
+    from core.reactive_contract import resolve_actions
+    from generator.lvgl import _runtime_expression
+    c = _extract_rules_fixture(tmp_path, '''function App(){const [prefs,setPrefs]=useState({gain:2,level:3});
+      const reset=()=>{setPrefs(p=>({...p,gain:17}));setPrefs(p=>({...p,level:p.gain+1}));};
+      const twice=()=>{setPrefs(p=>({...p,gain:p.gain+1}));setPrefs(p=>({...p,gain:p.gain+1}));};
+      return <div/>;}''')
+    reset = resolve_actions(['id', 'reset'], c)
+    assert _runtime_expression(reset[1]['value'], c) == '(17 + 1)'
+    twice = resolve_actions(['id', 'twice'], c)
+    assert len(twice) == 1 and _runtime_expression(twice[0]['value'], c).count(' + 1') == 2
