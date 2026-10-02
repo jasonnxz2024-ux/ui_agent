@@ -1,790 +1,125 @@
-import React, { useEffect, useRef, useState } from "react";
-import { createRoot } from "react-dom/client";
-import "./styles.css";
-import "./fixes.css";
+import React, { useEffect, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import './styles.css';
 
-const initialLogs = [
-  ["15:42:08", "系统", "工作区已就绪，等待输入源码"],
-  ["15:42:11", "扫描器", "支持 React / Figma Make 项目"],
-];
-function App() {
-  const [path, setPath] = useState("D:\\projects\\energy-dashboard");
-  const [files, setFiles] = useState([]);
-  const [tab, setTab] = useState("resources");
-  const [outputDir, setOutputDir] = useState("");
-  const [history, setHistory] = useState([]);
-  const [historyOpen, setHistoryOpen] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [logs, setLogs] = useState(initialLogs);
-  const logsRef = useRef(initialLogs);
-  const [taskId, setTaskId] = useState(null);
-  const [resources, setResources] = useState([]);
-  const [components, setComponents] = useState([]);
-  const [events, setEvents] = useState([]);
-  const [generated, setGenerated] = useState(null);
-  const [preflight, setPreflight] = useState(null);
-  const videoFrames = 0;
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [modelEnabled, setModelEnabled] = useState(false);
-  const [agentEnabled, setAgentEnabled] = useState(false);
-  const [agentStatus, setAgentStatus] = useState("disabled");
-  const [modelName, setModelName] = useState("");
-  const [baseUrl, setBaseUrl] = useState("");
-  const [stationToken, setStationToken] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [tokenConfigured, setTokenConfigured] = useState(false);
-  const [availableModels, setAvailableModels] = useState([]);
-  const [connectionStatus, setConnectionStatus] = useState("未测试");
-  const [validationRunning, setValidationRunning] = useState(false);
-  const [validationResult, setValidationResult] = useState(null);
-  const [deployment, setDeployment] = useState("station");
-  const [allowInternalByok, setAllowInternalByok] = useState(false);
-  const [apiOnly, setApiOnly] = useState(false);
-  const [provider, setProvider] = useState("openai");
-  const [providerPresets, setProviderPresets] = useState({});
-  const addLog = (who, msg) =>
-    setLogs((l) => [
-      ...l,
-      [new Date().toLocaleTimeString("zh-CN", { hour12: false }), who, msg],
-    ]);
-  useEffect(() => {
-    logsRef.current = logs;
-  }, [logs]);
-  const readResponse = async (response) => {
-    const text = await response.text();
-    let data;
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      throw new Error(
-        text.replace(/^Internal Server Error\s*/i, "").trim() ||
-          `HTTP ${response.status}`,
-      );
-    }
-    if (!response.ok) {
-      const detail = data.detail || data.message || `HTTP ${response.status}`;
-      throw new Error(
-        typeof detail === "string"
-          ? detail
-          : detail.message || JSON.stringify(detail),
-      );
-    }
-    return data;
-  };
-  useEffect(() => {
-    const historyButton = [...document.querySelectorAll("button")].find((b) =>
-      b.textContent.includes("项目历史"),
-    );
-    if (historyButton) historyButton.onclick = loadHistory;
-    const action = document.querySelector(".action-row");
-    if (action && !document.getElementById("output-picker")) {
-      const wrap = document.createElement("div");
-      wrap.id = "output-picker";
-      wrap.className = "output-picker";
-      wrap.innerHTML =
-        '<input placeholder="输出目录（可选）"/><button>选择输出目录</button>';
-      action.prepend(wrap);
-      wrap.querySelector("input").oninput = (e) => setOutputDir(e.target.value);
-      wrap.querySelector("button").onclick = chooseOutput;
-    }
-    const logHead = document.querySelector(".logs-head");
-    if (logHead && !document.getElementById("copy-logs")) {
-      const b = document.createElement("button");
-      b.id = "copy-logs";
-      b.textContent = "复制日志";
-      b.onclick = copyLogs;
-      logHead.appendChild(b);
-    }
-    let modal = document.getElementById("history-modal");
-    if (historyOpen && !modal) {
-      modal = document.createElement("div");
-      modal.id = "history-modal";
-      modal.className = "modal-backdrop";
-      modal.innerHTML =
-        '<div class="history-modal"><h2>历史项目</h2><div class="history-items"></div><button>关闭</button></div>';
-      modal.querySelector("button").onclick = () => setHistoryOpen(false);
-      document.body.appendChild(modal);
-    }
-    if (modal && !historyOpen) {
-      modal.remove();
-    }
-    if (modal && historyOpen) {
-      const list = modal.querySelector(".history-items");
-      list.innerHTML = "";
-      history.forEach((item) => {
-        const b = document.createElement("button");
-        b.className = "history-item";
-        b.textContent = item.project || item.path;
-        b.title = item.path;
-        b.onclick = () => {
-          setOutputDir(item.path);
-          setHistoryOpen(false);
-          addLog("历史", "已选择 " + item.path);
-        };
-        list.appendChild(b);
-      });
-    }
-  }, [progress, historyOpen, history]);
-  useEffect(() => {
-    setAgentEnabled(true);
-    setAgentStatus("local deterministic planner");
-  }, []);
-  const chooseSource = async () => {
-    try {
-      const data = await readResponse(await fetch("/api/dialog/source"));
-      if (data.path) {
-        setPath(data.path);
-        setFiles([data.path]);
-        addLog("输入", "已选择源码目录：" + data.path);
-      }
-    } catch (error) {
-      addLog("错误", error.message);
-    }
-  };
-  const chooseOutput = async () => {
-    try {
-      const data = await readResponse(await fetch("/api/dialog/output"));
-      if (data.path) {
-        setOutputDir(data.path);
-        addLog("输出", "已选择工程目录：" + data.path);
-      }
-    } catch (error) {
-      addLog("错误", error.message);
-    }
-  };
-  const loadHistory = async () => {
-    try {
-      const data = await readResponse(await fetch("/api/history"));
-      setHistory(data.items || []);
-      setHistoryOpen(true);
-    } catch (error) {
-      addLog("错误", error.message);
-    }
-  };
-  const copyLogs = async () => {
-    const value = logsRef.current.map((l) => l.join(" | ")).join("\n");
-    try {
-      await navigator.clipboard.writeText(value);
-      addLog("系统", "日志已复制到剪贴板");
-    } catch {
-      addLog("警告", "剪贴板不可用，请手动选择日志文本");
-    }
-  };
-  const runPreflight = async () => {
-    const data = await readResponse(
-      await fetch("/api/preflight", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source_dir: path }),
-      }),
-    );
-    setPreflight(data);
-    setAgentStatus(data.agent?.status || "disabled");
-    addLog(
-      "前置检测",
-      data.status === "ready"
-        ? `通过：${data.components?.reachable || 0} 个可达组件，${data.scroll_components || 0} 个滚动区域`
-        : `阻断：${(data.blockers || []).join("；")}`,
-    );
-    return data;
-  };
-  const parse = async () => {
-    if (running) return;
-    setRunning(true);
-    setGenerated(null);
-    setProgress(8);
-    addLog("前置检测", "正在检查项目可生成性…");
-    try {
-      const check = await runPreflight();
-      if (check.status !== "ready")
-        throw new Error((check.blockers || ["前置检测未通过"]).join("；"));
-      setProgress(18);
-      addLog("解析器", "开始建立组件树…");
-      const data = await readResponse(
-        await fetch("/api/analyze", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source_dir: path }),
-        }),
-      );
-      const summary = data.summary || {};
-      setPreflight(data.preflight || check);
-      setTaskId(data.task_id);
-      setResources(
-        (summary.resources || []).map((r, i) => ({
-          icon: r.kind === "svg" ? "◉" : "▧",
-          name: (r.path || r.id).split(/[\\/]/).pop(),
-          meta: (r.kind || "asset").toUpperCase(),
-          tone: ["blue", "violet", "amber"][i % 3],
-        })),
-      );
-      setComponents(
-        (summary.components || []).map((c) => ({
-          name: (c.id || "component").split(":").pop(),
-          kind: c.kind || "unknown",
-          count: "1",
-        })),
-      );
-      setEvents(summary.events || []);
-      setProgress(100);
-      addLog(
-        "解析器",
-        `解析完成：${(summary.components || []).length} 组件，${(summary.events || []).length} 事件，${(summary.resources || []).length} 资源`,
-      );
-    } catch (error) {
-      addLog("错误", error.message);
-      setProgress(0);
-    } finally {
-      setRunning(false);
-    }
-  };
-  const generate = async () => {
-    if (!taskId) {
-      addLog("错误", "请先完成源码解析");
-      return;
-    }
-    addLog("生成器", "正在生成 LVGL / UIBuilder 工程…");
-    try {
-      const data = await readResponse(
-        await fetch("/api/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            task_id: taskId,
-            output_dir: outputDir || null,
-          }),
-        }),
-      );
-      setGenerated(data);
-      addLog("生成器", `✓ 输出完成：${data.units || 0} 个生成单元`);
-      if (data.output?.project) addLog("输出", data.output.project);
-      (data.warnings || []).forEach((w) => addLog("警告", w));
-    } catch (error) {
-      addLog("错误", error.message);
-    }
-  };
-  const runVisualValidation = async () => {
-    if (validationRunning) return;
-    if (!outputDir) {
-      addLog("错误", "视觉增强验证前请先选择工程输出目录");
-      return;
-    }
-    setValidationRunning(true);
-    addLog("验证", "启动持久 Browser、Windows SDL 与最多 5 轮 90% 门禁验证…");
-    try {
-      const data = await readResponse(
-        await fetch("/api/validate/visual", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            source_dir: path,
-            output_dir: outputDir,
-            max_rounds: 5,
-          }),
-        }),
-      );
-      const gate = data.validation?.deterministic_gate || {};
-      setGenerated(data);
-      setValidationResult(data);
-      addLog(
-        "验证",
-        `${data.export_ready ? "✓ 已通过" : "未通过"}：${Math.round((gate.confidence || 0) * 100)}% / 90%，${(data.rounds || []).length} 轮`,
-      );
-      (data.validation?.errors || [])
-        .slice(0, 8)
-        .forEach((e) => addLog("阻断", e));
-    } catch (error) {
-      addLog("错误", error.message);
-    } finally {
-      setValidationRunning(false);
-    }
-  };
-  const status = running
-    ? "解析中"
-    : progress === 100
-      ? "解析完成"
-      : "等待输入";
-  const projectName =
-    path.split(/[\\/]/).filter(Boolean).pop() || "React Project";
-  const semanticKinds = [...new Set(components.map((item) => item.kind))].slice(
-    0,
-    6,
-  );
-  return (
-    <div className="app">
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark">✦</span>
-          <span>uagent</span>
-          <small>DESIGN → EMBEDDED</small>
-        </div>
-        <nav>
-          <div className="nav-label">WORKSPACE</div>
-          <button className="nav-item active">
-            ⌘ <span>转换工作台</span>
-          </button>
-          <button className="nav-item">
-            ◌ <span>项目历史</span>
-          </button>
-          <button className="nav-item" onClick={() => setSettingsOpen(true)}>
-            ⚙ <span>本地规划</span>
-          </button>
-        </nav>
-        <div className="sidebar-bottom">
-          <div className="engine">
-            <span className="online" /> Local Engine <b>v0.1</b>
-          </div>
-          <div className="user">
-            <span>JG</span>
-            <div>
-              Jason Gao<small>Developer</small>
-            </div>
-            <i>•••</i>
-          </div>
-        </div>
-      </aside>
-      <main>
-        <header>
-          <div>
-            <div className="eyebrow">CONVERSION WORKSPACE · 0.4.0</div>
-            <h1>
-              设计转换工作台{" "}
-              <span className="status-pill">
-                <span className={running ? "pulse" : "online"} />
-                {status}
-              </span>
-            </h1>
-          </div>
-          <div className="header-actions">
-            <button className="icon-btn">⌕</button>
-            <button className="icon-btn">?</button>
-            <button className="avatar">JG</button>
-          </div>
-        </header>
-        <section className="input-row">
-          <div className="input-card source-card">
-            <div className="card-head">
-              <div>
-                <span className="section-kicker">01 · SOURCE CODE</span>
-                <h2>输入源码目录</h2>
-              </div>
-              <span className="card-icon">⌁</span>
-            </div>
-            <div className="path-input">
-              <span>⌂</span>
-              <input
-                value={path}
-                onChange={(e) => setPath(e.target.value)}
-                aria-label="源码目录"
-              />
-              <button onClick={chooseSource}>选择目录</button>
-            </div>
-            <div className="hint">
-              支持 React / Vite / Figma Make&nbsp; · &nbsp;
-              {files.length ? "已选择本机目录" : "也可直接粘贴绝对路径"}
-            </div>
-          </div>
-        </section>
-        {preflight && (
-          <section className={"preflight " + preflight.status}>
-            <div>
-              <span className="section-kicker">
-                PREFLIGHT · {preflight.status.toUpperCase()}
-              </span>
-              <strong>
-                {preflight.status === "ready"
-                  ? "项目可以进入转换"
-                  : "项目暂不能转换"}
-              </strong>
-            </div>
-            <dl>
-              <div>
-                <dt>解析策略</dt>
-                <dd>{preflight.parser}</dd>
-              </div>
-              <div>
-                <dt>包管理器</dt>
-                <dd>{preflight.package_manager}</dd>
-              </div>
-              <div>
-                <dt>可达组件</dt>
-                <dd>{preflight.components?.reachable || 0}</dd>
-              </div>
-              <div>
-                <dt>滚动区域</dt>
-                <dd>{preflight.scroll_components || 0}</dd>
-              </div>
-              <div>
-                <dt>资源 / 事件</dt>
-                <dd>
-                  {preflight.resources || 0} / {preflight.events || 0}
-                </dd>
-              </div>
-              <div>
-                <dt>导航确认</dt>
-                <dd>
-                  {preflight.navigation?.confirmed || 0} /{" "}
-                  {preflight.navigation?.detected || 0}
-                </dd>
-              </div>
-            </dl>
-            {preflight.source_browser_plan && (
-              <div className="capability-counts">
-                {Object.entries(preflight.source_browser_plan).map(
-                  ([key, value]) => (
-                    <span key={key}>
-                      {key} {value.source}/{value.browser ?? "—"}/{value.plan}
-                    </span>
-                  ),
-                )}
-              </div>
-            )}
-            <p>
-              Agent planning：{preflight.agent_planning?.status || "enabled"} ·{" "}
-              {preflight.agent_planning?.mode || "runtime-first-local"} ·{" "}
-              {preflight.agent_planning?.evidence_mode || "source-fallback"}
-            </p>
-            <p>
-              Agent 增强：{preflight.agent?.status || agentStatus} ·
-              仅处理未决/低置信度证据
-            </p>
-            {preflight.navigation?.items?.map((item) => (
-              <p key={item.id}>
-                导航 {item.trigger} → {item.target_component || item.target} ·{" "}
-                {Math.round(item.confidence * 100)}%{" "}
-                {item.status === "confirmed" ? "已确认" : "待验证"}
-              </p>
-            ))}
-            {[...(preflight.blockers || []), ...(preflight.warnings || [])].map(
-              (item, i) => (
-                <p key={"message-" + i}>{item}</p>
-              ),
-            )}
-          </section>
-        )}
-        <section className="action-row">
-          <button
-            className="preflight-btn"
-            onClick={() =>
-              runPreflight().catch((error) => addLog("错误", error.message))
-            }
-            disabled={running}
-          >
-            前置检测
-          </button>
-          <div className="parse-progress">
-            <div className="progress-top">
-              <span>
-                <span className="dot" /> {running ? "正在解析项目" : "解析项目"}
-              </span>
-              <b>{progress}%</b>
-            </div>
-            <div className="bar">
-              <i style={{ width: progress + "%" }} />
-            </div>
-          </div>
-          <button className="primary" onClick={parse} disabled={running}>
-            {running ? "解析中…" : "开始解析"} <span>↗</span>
-          </button>
-        </section>
-        <section className="workspace">
-          <div className="panel">
-            <div className="panel-tabs">
-              <button
-                className={tab === "resources" ? "selected" : ""}
-                onClick={() => setTab("resources")}
-              >
-                资源 <b>{resources.length}</b>
-              </button>
-              <button
-                className={tab === "components" ? "selected" : ""}
-                onClick={() => setTab("components")}
-              >
-                组件 <b>{components.length}</b>
-              </button>
-              <button
-                className={tab === "logic" ? "selected" : ""}
-                onClick={() => setTab("logic")}
-              >
-                交互逻辑 <b>{events.length}</b>
-              </button>
-            </div>
-            <div className="panel-body">
-              {tab === "resources" && (
-                <>
-                  <div className="panel-title">
-                    <div>
-                      <h3>资源清单</h3>
-                      <p>从源码中发现的视觉资产</p>
-                    </div>
-                    <button className="filter">全部⌄</button>
-                  </div>
-                  <div className="resource-grid">
-                    {resources.length ? (
-                      resources.map((r) => (
-                        <div className="resource" key={r.name}>
-                          <div className={"thumb " + r.tone}>{r.icon}</div>
-                          <div>
-                            <strong>{r.name}</strong>
-                            <small>{r.meta}</small>
-                          </div>
-                          <span>⋮</span>
-                        </div>
-                      ))
-                    ) : (
-                      <div className="empty">解析后显示资源</div>
-                    )}
-                  </div>
-                </>
-              )}
-              {tab === "components" && (
-                <>
-                  <div className="panel-title">
-                    <div>
-                      <h3>组件树</h3>
-                      <p>已识别并映射到目标平台</p>
-                    </div>
-                    <button className="filter">按类型⌄</button>
-                  </div>
-                  <div className="component-list">
-                    {components.length ? (
-                      components.map((c) => (
-                        <div className="component" key={c.name}>
-                          <span className="comp-symbol">◇</span>
-                          <div>
-                            <strong>{c.name}</strong>
-                            <small>{c.kind}</small>
-                          </div>
-                          <b>{c.count}</b>
-                        </div>
-                      ))
-                    ) : (
-                      <div className="empty">解析后显示组件</div>
-                    )}
-                  </div>
-                </>
-              )}
-              {tab === "logic" && (
-                <>
-                  <div className="panel-title">
-                    <div>
-                      <h3>交互逻辑</h3>
-                      <p>从源码事件与视频回溯推断 · {videoFrames} 帧证据</p>
-                    </div>
-                  </div>
-                  <div className="logic-list">
-                    {events.length ? (
-                      events.map((event, i) => (
-                        <div key={event.id || i}>
-                          ↔ <span>{event.id || event.kind || "事件"}</span>
-                          <small>
-                            {event.kind || event.handler || "交互事件"}
-                          </small>
-                        </div>
-                      ))
-                    ) : (
-                      <div className="empty">解析后显示交互事件</div>
-                    )}
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-          <div className="preview">
-            <div className="preview-head">
-              <div>
-                <span className="section-kicker">SEMANTIC PREVIEW</span>
-                <h3>转换覆盖概览</h3>
-              </div>
-              <div className="device-toggle">
-                <button>Source</button>
-                <button className="on">LVGL</button>
-              </div>
-            </div>
-            <div className="device semantic-device">
-              <div className="device-top">
-                <span>{projectName.toUpperCase()}</span>
-                <span className={progress === 100 ? "ready-dot" : ""}>
-                  ● {status}
-                </span>
-              </div>
-              <div className="semantic-content">
-                <div className="semantic-hero">
-                  <span>✦</span>
-                  <h4>
-                    {progress === 100 ? "中间模型已建立" : "等待解析源码"}
-                  </h4>
-                  <p>
-                    {progress === 100
-                      ? "每项识别结果均可在左侧核对，不以模拟图片冒充真实预览。"
-                      : "选择 React / Figma Make 目录后开始扫描。"}
-                  </p>
-                </div>
-                <div className="coverage-grid">
-                  <div>
-                    <strong>{components.length}</strong>
-                    <small>组件</small>
-                  </div>
-                  <div>
-                    <strong>{events.length}</strong>
-                    <small>事件</small>
-                  </div>
-                  <div>
-                    <strong>{resources.length}</strong>
-                    <small>资源</small>
-                  </div>
-                  <div>
-                    <strong>{videoFrames}</strong>
-                    <small>视频帧</small>
-                  </div>
-                </div>
-                <div className="kind-cloud">
-                  {semanticKinds.length ? (
-                    semanticKinds.map((kind) => <span key={kind}>{kind}</span>)
-                  ) : (
-                    <span>尚无适配数据</span>
-                  )}
-                </div>
-                {generated && (
-                  <div className="generated-note">
-                    ✓ 已生成 {generated.units || 0} 个 LVGL 单元
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-        </section>
-        <section className="bottom-row">
-          <div className="logs">
-            <div className="logs-head">
-              <div>
-                <span className="section-kicker">ACTIVITY LOG</span>
-                <h3>运行日志</h3>
-              </div>
-              <button onClick={() => setLogs([])}>清空</button>
-            </div>
-            <div className="log-body">
-              {logs.length ? (
-                logs.map((l, i) => (
-                  <div key={i}>
-                    <time>{l[0]}</time>
-                    <b>{l[1]}</b>
-                    <span>{l[2]}</span>
-                  </div>
-                ))
-              ) : (
-                <div className="empty">暂无日志</div>
-              )}
-            </div>
-          </div>
-          <button
-            className="generate"
-            onClick={runVisualValidation}
-            disabled={validationRunning}
-          >
-            <span>◉</span>
-            <div>
-              <strong>{validationRunning ? "验证中…" : "视觉增强验证"}</strong>
-              <small>Browser ↔ SDL · 90% 门禁</small>
-            </div>
-            <b>↗</b>
-          </button>
-          <button className="generate" onClick={generate}>
-            <span>✦</span>
-            <div>
-              <strong>生成工程</strong>
-              <small>输出 LVGL / UIBuilder 项目</small>
-            </div>
-            <b>↗</b>
-          </button>
-        </section>
-      </main>
-      {settingsOpen && (
-        <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && setSettingsOpen(false)}>
-          <div className="settings-modal">
-            <div className="settings-title"><h2>本地 Agent planning</h2><button onClick={() => setSettingsOpen(false)}>×</button></div>
-            <p>确定性本地规划已启用。浏览器布局证据与源码模型会进入 audit；本构建不配置模型服务、API Key 或远程视觉验证。</p>
-          </div>
-        </div>
-      )}
-      {validationResult && (
-        <div
-          className="modal-backdrop"
-          onMouseDown={(e) =>
-            e.target === e.currentTarget && setValidationResult(null)
-          }
-        >
-          <div className="validation-modal">
-            <div className="settings-title">
-              <div>
-                <span className="section-kicker">BROWSER ↔ WINDOWS SDL</span>
-                <h2>视觉增强验证结果</h2>
-              </div>
-              <button onClick={() => setValidationResult(null)}>×</button>
-            </div>
-            <div
-              className={
-                validationResult.export_ready
-                  ? "validation-pass"
-                  : "validation-fail"
-              }
-            >
-              {validationResult.export_ready
-                ? "已通过 90% 确定性门禁"
-                : "未通过，工程不可交付"}
-            </div>
-            <div className="validation-rounds">
-              {(validationResult.rounds || []).map((round) => (
-                <article className="validation-round" key={round.round}>
-                  <header>
-                    <strong>
-                      第 {round.round} 轮 ·{" "}
-                      {Math.round((round.confidence || 0) * 100)}%
-                    </strong>
-                    <span>
-                      {round.passed
-                        ? "通过"
-                        : `本轮后应用 ${round.repair?.applied || 0} 项修复`}
-                    </span>
-                  </header>
-                  {round.comparison ? (
-                    <div className="comparison-grid">
-                      <figure>
-                        <img
-                          src={round.comparison.browser_image}
-                          alt={`第 ${round.round} 轮 Browser`}
-                        />
-                        <figcaption>Browser evidence</figcaption>
-                      </figure>
-                      <figure>
-                        <img
-                          src={round.comparison.simulator_image}
-                          alt={`第 ${round.round} 轮 Windows SDL`}
-                        />
-                        <figcaption>
-                          Windows SDL · {round.round === 1 ? "初始输出" : "上一轮修复后"}
-                        </figcaption>
-                      </figure>
-                    </div>
-                  ) : (
-                    <p className="comparison-missing">
-                      本轮未生成截图：
-                      {round.errors?.[0] || "验证在截图前停止"}
-                    </p>
-                  )}
-                  {round.stop_reason && (
-                    <p className="comparison-note">
-                      停止原因：{round.stop_reason}
-                    </p>
-                  )}
-                </article>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
+async function api(path, options = {}) {
+  const response = await fetch(path, options);
+  let data;
+  try { data = JSON.parse(await response.text()); }
+  catch { throw new Error('本地服务未返回有效结果，请查看运行日志或重新打开程序。'); }
+  if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '请求失败，请检查输入。');
+  return data;
 }
-createRoot(document.getElementById("root")).render(<App />);
+const post = (path, data) => api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) });
+const titles = { queued: '准备转换', running: '转换进行中', passed: '当前尺寸验证通过', blocked: '暂时无法转换', failed: '转换运行失败' };
+function reasonTitle(reason) {
+  if (/duplicate state|duplicate function/i.test(reason)) return '组件作用域或独立实例状态尚未实现';
+  if (/Unsupported initial state|record update|bounded arrays|array.*unsupported/i.test(reason)) return '此状态或对象列表暂不支持执行';
+  if (/timeout|timer|interval|scheduling/i.test(reason)) return '此定时任务的调度或生命周期暂不支持';
+  if (/dynamic source node|source event has no runtime object|view not found|not observed/i.test(reason)) return '部分动态界面或控件尚未完整映射';
+  if (/filter primitive|filter|clipPath/i.test(reason)) return '此 SVG 效果暂无可执行的绘制配方';
+  if (/File|files|host/i.test(reason)) return '此文件操作或宿主功能暂不支持';
+  if (/capacity|overflow/i.test(reason)) return '数据超过配置的容量上限';
+  if (/callback|reactive expression/i.test(reason)) return '此交互逻辑尚未实现';
+  return '';
+}
+function Reason({ reason }) {
+  const title = reasonTitle(reason);
+  return <li>{title && <strong>{title}<br/></strong>}{reason}</li>;
+}
+
+function App() {
+  const [source, setSource] = useState('');
+  const [width, setWidth] = useState(1024);
+  const [height, setHeight] = useState(600);
+  const [dependencies, setDependencies] = useState('');
+  const [capacity, setCapacity] = useState(64);
+  const [outputRoot, setOutputRoot] = useState('D:\\uiagent_oct');
+  const [job, setJob] = useState(null);
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [picking, setPicking] = useState(false);
+  const running = submitting || job?.status === 'running' || job?.status === 'queued';
+
+  useEffect(() => {
+    api('/api/runtime-convert/config').then(data => setOutputRoot(data.output_root)).catch(e => setError(e.message));
+  }, []);
+  useEffect(() => {
+    if (!job || !['queued', 'running'].includes(job.status)) return;
+    let canceled = false;
+    let timer;
+    const poll = async () => {
+      try {
+        const current = await api(`/api/runtime-convert/jobs/${job.id}`);
+        if (canceled) return;
+        setError('');
+        setJob(current);
+        if (['queued', 'running'].includes(current.status)) timer = setTimeout(poll, 1200);
+      } catch (e) {
+        if (!canceled) {
+          setError(`无法读取任务状态：${e.message}。请保持程序打开，稍后会重试。`);
+          timer = setTimeout(poll, 3000);
+        }
+      }
+    };
+    timer = setTimeout(poll, 400);
+    return () => { canceled = true; clearTimeout(timer); };
+  }, [job?.id, job?.status]);
+
+  async function pick() {
+    setError(''); setPicking(true);
+    try { const data = await api('/api/dialog/source'); if (data.path) setSource(data.path); }
+    catch (e) { setError(e.message); }
+    finally { setPicking(false); }
+  }
+  async function convert(event) {
+    event.preventDefault(); setError(''); setJob(null); setSubmitting(true);
+    try {
+      const current = await post('/api/runtime-convert/jobs', {
+        source_dir: source.trim(), width: Number(width), height: Number(height),
+        dependencies: dependencies.trim(), list_capacity: Number(capacity),
+      });
+      setJob(current);
+    } catch (e) { setError(e.message); }
+    finally { setSubmitting(false); }
+  }
+  async function action(name) {
+    setError('');
+    try { await post(`/api/runtime-convert/jobs/${job.id}/${name}`); }
+    catch (e) { setError(e.message); }
+  }
+
+  return <main>
+    <header><div className="brand-mark">U</div><div><strong>UAgent</strong><span>React / Figma Make → LVGL · Windows SDL</span></div><span className="local-badge">本地转换 · 无 AI 调用</span></header>
+    <section className="intro"><p className="eyebrow">从源码到可运行界面</p><h1>选择工程，开始转换。</h1><p>解析 React 源码与浏览器布局，生成 LVGL C 工程，并编译验证 SDL 示例。</p></section>
+    {error && <div className="error-banner" style={{marginBottom:20}} role="alert"><strong>操作未完成</strong><p>{error}</p></div>}
+    <div className="workspace">
+      <form className="panel form-panel" onSubmit={convert}>
+        <div className="section-title"><span className="step">1</span><h2>工程与尺寸</h2></div>
+        <label htmlFor="source">React 工程目录</label>
+        <div className="path-row"><input id="source" value={source} onChange={e => setSource(e.target.value)} placeholder="选择包含 package.json 的工程目录" required disabled={running || picking}/><button type="button" onClick={pick} disabled={running || picking}>{picking ? '选择中…' : '浏览…'}</button></div>
+        <p className="hint">请选择源码文件夹。程序会先复制工程，再进行转换。</p>
+        <div className="dimensions"><div><label htmlFor="width">宽度</label><div className="number-field"><input id="width" type="number" min="1" max="8192" value={width} onChange={e => setWidth(e.target.value)} disabled={running} required/><span>px</span></div></div><div><label htmlFor="height">高度</label><div className="number-field"><input id="height" type="number" min="1" max="8192" value={height} onChange={e => setHeight(e.target.value)} disabled={running} required/><span>px</span></div></div></div>
+        <div className="presets">{[[320, 240], [1024, 600], [1280, 800]].map(([w, h]) => <button type="button" key={w} disabled={running} onClick={() => { setWidth(w); setHeight(h); }} className={Number(width) === w && Number(height) === h ? 'selected' : ''}>{w} × {h}</button>)}</div>
+        <div className="destination"><span>输出位置</span><code>{outputRoot}</code><p>每次转换创建独立子目录，保留之前的结果。</p></div>
+        <details className="advanced"><summary>可选设置</summary><label htmlFor="dependencies">已有 node_modules 目录</label><input id="dependencies" value={dependencies} disabled={running} onChange={e => setDependencies(e.target.value)} placeholder="留空则使用工程自身的依赖"/><p className="hint">工程需要兼容的 Vite 与 TypeScript。本机还需 Node.js、CMake 及 LVGL/SDL 编译工具链。</p><label htmlFor="capacity">列表容量上限</label><input id="capacity" type="number" min="1" max="1024" value={capacity} disabled={running} onChange={e => setCapacity(e.target.value)}/><p className="hint">默认 64。超过容量会明确报错，不会静默截断。</p></details>
+        <button className="primary convert" type="submit" disabled={running || picking}>{running ? '正在转换…' : '开始转换'}<span aria-hidden="true">→</span></button>
+        <p className="hint centered">转换过程可能需要数分钟。</p>
+      </form>
+      <section className={`panel result-panel ${job?.status || ''}`} aria-live="polite">
+        <div className="section-title"><span className="step">2</span><h2>转换结果</h2></div>
+        {!job ? <div className="empty"><div className="empty-icon" aria-hidden="true">↗</div><h3>等待选择工程</h3><p>转换完成后，在这里查看结果或无法转换的原因。</p></div> : <>
+          <div className="status-line"><span className={`status-dot ${running ? 'pulse' : ''}`}/><h3>{titles[job.status]}</h3></div>
+          <p className="message">{job.message}</p>
+          <div className="meta"><span>{job.width} × {job.height}</span><span>已用时 {job.elapsed_seconds || 0} 秒</span></div>
+          {job.status === 'passed' && <div className="success-note">{typeof job.ssim === 'number' && <strong>画面相似度指标 SSIM {(job.ssim * 100).toFixed(1)}%</strong>}<p>通过当前尺寸的初始画面与采样状态验证，不代表所有交互和尺寸均已覆盖。</p><button className="primary" type="button" onClick={() => action('preview')}>打开 SDL 示例</button></div>}
+          {!!job.blockers?.length && <div className="blocker-list"><strong>{job.status === 'blocked' ? '阻断原因' : '失败原因'} · {job.blockers.length} 项</strong><ol>{job.blockers.slice(0, 4).map((reason, i) => <Reason key={i} reason={reason}/>)}</ol>{job.blockers.length > 4 && <details><summary>查看其余 {job.blockers.length - 4} 项</summary><ol start="5">{job.blockers.slice(4).map((reason, i) => <Reason key={i} reason={reason}/>)}</ol></details>}</div>}
+          {!running && <><button type="button" className="output-button" onClick={() => action('open-output')}>打开输出文件夹</button><p className="file-path"><code>{job.output}</code></p><p className="hint">完整报告：conversion-report.json<br/>运行日志：conversion.log</p></>}
+          {job.log_tail && <details className="logs"><summary>运行日志</summary><pre>{job.log_tail}</pre></details>}
+        </>}
+      </section>
+    </div>
+    <footer>未知或尚未支持的能力会明确阻断转换。能力不支持时，不会提供可运行的完成结果。</footer>
+  </main>;
+}
+createRoot(document.getElementById('root')).render(<App/>);

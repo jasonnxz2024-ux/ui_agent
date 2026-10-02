@@ -16,6 +16,9 @@ import shutil
 import subprocess
 import time
 import urllib.request
+import threading
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 from core import browser_layout
 from core.pipeline import analyze
@@ -159,15 +162,47 @@ def prepare_browser_entry(source: Path) -> bool:
     return True
 
 
+class ProductionServer:
+    """A local static host that also works in a frozen executable."""
+    def __init__(self, directory: Path, log):
+        log_lock = threading.Lock()
+        class Handler(SimpleHTTPRequestHandler):
+            extensions_map = {**SimpleHTTPRequestHandler.extensions_map, '.js': 'text/javascript'}
+            def log_message(self, message, *args):
+                try:
+                    with log_lock:
+                        log.write(message % args + '\n'); log.flush()
+                except (OSError, ValueError):
+                    pass  # A daemon request may finish during shutdown.
+        self.http = ThreadingHTTPServer(('127.0.0.1', 0), partial(Handler, directory=str(directory)))
+        self.thread = threading.Thread(target=lambda: self.http.serve_forever(poll_interval=.1), daemon=True)
+        self.thread.start()
+        self.url = f'http://127.0.0.1:{self.http.server_port}/'
+        self.stopped = False
+
+    def terminate(self):
+        if not self.stopped:
+            self.stopped = True
+            self.http.shutdown()
+            self.http.server_close()
+
+    def wait(self, timeout=10):
+        self.thread.join(timeout)
+        if self.thread.is_alive():
+            raise TimeoutError('Production browser server did not stop')
+        return 0
+
+
 def serve_production(source: Path, output: Path):
     result=subprocess.run([browser_layout._node(),str(source/'node_modules/vite/bin/vite.js'),'build','--outDir',str(output/'browser-build')],cwd=source,capture_output=True,text=True,encoding='utf-8',timeout=90)
     (output/'browser-build.log').write_text(result.stdout+result.stderr,encoding='utf-8')
     if result.returncode:raise RuntimeError('Production browser build failed; see browser-build.log')
-    port=browser_layout._free_port();url=f'http://127.0.0.1:{port}/'
-    import sys
-    script="import http.server,mimetypes,sys;mimetypes.add_type('text/javascript','.js');http.server.test(HandlerClass=lambda *a,**k:http.server.SimpleHTTPRequestHandler(*a,directory=sys.argv[2],**k),port=int(sys.argv[1]),bind='127.0.0.1')"
     log=(output/'browser-server.log').open('w',encoding='utf-8')
-    server=subprocess.Popen([sys.executable,'-c',script,str(port),str(output/'browser-build')],cwd=output,stdout=log,stderr=log)
+    try:
+        server=ProductionServer(output/'browser-build',log)
+    except Exception:
+        log.close();raise
+    url=server.url
     if not browser_layout._wait_url(url,15):server.terminate();server.wait(timeout=10);log.close();raise RuntimeError('Production browser server failed')
     return server,url,log
 

@@ -27,7 +27,7 @@ a = Analysis(
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, a.binaries, a.datas, [],
-    name='UAgent-Agent-Enhanced-0.4.4',
+    name='UAgent',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

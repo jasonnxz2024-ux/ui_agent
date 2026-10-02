@@ -20,6 +20,8 @@ from core.browser_layout import capture_layout
 from tools.cross_validate import cross_validate
 
 app = FastAPI(title="UAgent", version="0.1.0")
+from server.runtime_jobs import router as runtime_router
+app.include_router(runtime_router)
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
 SOURCE_ROOT = Path(__file__).resolve().parents[1]

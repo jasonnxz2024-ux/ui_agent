@@ -21,7 +21,14 @@ def _free_port() -> int:
 def main() -> None:
     # The console sibling and GUI --convert share the exact local compiler.
     # No server, browser UI or model service is needed to invoke the command.
-    if '--convert' in sys.argv[1:2] or os.path.basename(sys.executable).lower() == 'uagent-convert.exe':
+    if '--convert' in sys.argv[1:2] or (os.path.basename(sys.executable).lower() == 'uagent-convert.exe' and len(sys.argv) > 1):
+        # A GUI bootloader has no console streams, even when used as our
+        # conversion worker. Write its progress into the job's live log.
+        if sys.stdout is None:
+            sys.stdout = open(os.environ.get('UAGENT_CONVERSION_LOG') or os.devnull,
+                              'a', encoding='utf-8', buffering=1)
+        if sys.stderr is None:
+            sys.stderr = sys.stdout
         if sys.argv[1:2] == ['--convert']:
             del sys.argv[1]
         from tools.runtime_convert import main as convert_main
@@ -113,12 +120,12 @@ def main() -> None:
         import webview
 
         webview.create_window(
-            "UAgent · React/Figma Make → AiBuilder",
+            "UAgent · React → LVGL",
             url,
-            width=1440,
-            height=900,
-            min_size=(1050, 700),
-            background_color="#0d1016",
+            width=1080,
+            height=800,
+            min_size=(820, 650),
+            background_color="#f5f7fb",
         )
         webview.start(debug=False)
     except ImportError:

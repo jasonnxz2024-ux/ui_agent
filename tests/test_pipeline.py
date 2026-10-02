@@ -768,3 +768,149 @@ def test_queued_record_updates_keep_prior_fields_and_render_snapshot(tmp_path):
     assert _runtime_expression(reset[1]['value'], c) == '(17 + 1)'
     twice = resolve_actions(['id', 'twice'], c)
     assert len(twice) == 1 and _runtime_expression(twice[0]['value'], c).count(' + 1') == 2
+
+
+def _desktop_job_fixture(tmp_path, monkeypatch, status='sample-passed', accepted=True, exit_code=0, gate=None, write_report=True):
+    import json
+    from server import runtime_jobs
+    source = tmp_path/'source'; source.mkdir()
+    (source/'package.json').write_text('{}')
+    for filename in ('vite/bin/vite.js', 'typescript/lib/typescript.js'):
+        target = source/'node_modules'/filename
+        target.parent.mkdir(parents=True, exist_ok=True); target.write_text('fixture')
+    monkeypatch.setattr(runtime_jobs.shutil, 'which', lambda name: 'available')
+    captured = {}
+    class Process:
+        def __init__(self, command, **kwargs):
+            output = Path(command[command.index('--width')-1])
+            assert not list(output.iterdir())  # Live log must not break new-output validation.
+            captured.update(command=command, env=kwargs['env'], output=output)
+            kwargs['stdout'].write(b'Compiling source contract and runtime scene\n')
+            self.output = output
+        def wait(self, timeout=None):
+            if gate: gate.wait(3)
+            if write_report:
+                exe = self.output/'generated/main.exe'; exe.parent.mkdir(exist_ok=True); exe.write_bytes(b'fixture')
+                report = {'status':status,'accepted':accepted,'exe':str(exe),
+                          'blockers': ['Unknown SVG filter primitive'] if status == 'blocked' else [],
+                          'initial_frame_ssim':.97}
+                (self.output/'conversion-report.json').write_text(json.dumps(report))
+            return exit_code
+    manager = runtime_jobs.ConversionJobs(tmp_path/'outputs', process_factory=Process)
+    return manager, runtime_jobs.ConversionRequest(source_dir=str(source)), captured
+
+
+def _wait_desktop_job(manager, job_id):
+    import time
+    end = time.monotonic()+4
+    while time.monotonic()<end:
+        job = manager.get(job_id)
+        if job['status'] not in {'queued','running'}: return job
+        time.sleep(.01)
+    raise AssertionError('Desktop job did not finish')
+
+
+def test_desktop_converter_uses_isolated_command_and_empty_output(tmp_path, monkeypatch):
+    monkeypatch.setenv('UAGENT_HEADLESS','1')
+    monkeypatch.setenv('UAGENT_STARTUP_LOG','parent-trace')
+    manager, request, captured = _desktop_job_fixture(tmp_path, monkeypatch)
+    job = _wait_desktop_job(manager, manager.start(request)['id'])
+    assert job['status']=='passed' and job['exe']
+    assert Path(job['log_path']).parent == Path(job['output'])
+    assert 'UAGENT_HEADLESS' not in captured['env'] and 'UAGENT_STARTUP_LOG' not in captured['env']
+    assert (Path(request.source_dir)/'package.json').read_text()=='{}'
+    assert '--width' in captured['command'] and '--height' in captured['command']
+
+
+def test_desktop_gate_blocks_preview_even_when_report_claims_accepted(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from server import runtime_jobs
+    from server.app import app
+    manager, request, _ = _desktop_job_fixture(tmp_path, monkeypatch, status='blocked', accepted=True, exit_code=2)
+    monkeypatch.setattr(runtime_jobs, 'jobs', manager)
+    with TestClient(app) as client:
+        created = client.post('/api/runtime-convert/jobs',json=request.model_dump())
+        assert created.status_code == 202
+        job = _wait_desktop_job(manager, created.json()['id'])
+        assert job['status']=='blocked' and job['exe'] is None
+        assert client.post(f'/api/runtime-convert/jobs/{job["id"]}/preview').status_code==409
+        assert client.get('/api/runtime-convert/jobs/missing').status_code==404
+        assert client.post('/api/runtime-convert/jobs',json={**request.model_dump(),'width':0}).status_code==422
+
+
+def test_desktop_missing_report_and_nonzero_exit_cannot_pass(tmp_path, monkeypatch):
+    manager, request, _ = _desktop_job_fixture(tmp_path, monkeypatch, write_report=False, exit_code=1)
+    job = _wait_desktop_job(manager, manager.start(request)['id'])
+    assert job['status']=='failed' and '未生成报告' in job['blockers'][0]
+    from server.runtime_jobs import report_result
+    output = tmp_path/'result'; output.mkdir(); exe=output/'test.exe'; exe.write_bytes(b'fixture')
+    result = report_result({'status':'sample-passed','accepted':True,'exe':str(exe)},output,1)
+    assert result['status']=='failed' and result['exe'] is None
+    outside = tmp_path/'other.exe'; outside.write_bytes(b'fixture')
+    assert report_result({'status':'sample-passed','accepted':True,'exe':str(outside)},output,0)['status']=='failed'
+
+
+def test_desktop_rejects_second_running_job_without_new_output(tmp_path, monkeypatch):
+    import threading
+    import pytest
+    gate = threading.Event()
+    manager, request, _ = _desktop_job_fixture(tmp_path, monkeypatch, gate=gate)
+    first = manager.start(request)
+    before = set(manager.output_base.iterdir())
+    try:
+        with pytest.raises(RuntimeError,match='已有转换'): manager.start(request)
+        assert set(manager.output_base.iterdir()) == before
+    finally: gate.set()
+    assert _wait_desktop_job(manager, first['id'])['status']=='passed'
+
+
+def test_desktop_preflight_rejects_missing_dependencies_and_source_output_overlap(tmp_path, monkeypatch):
+    import pytest
+    from server.runtime_jobs import ConversionJobs, ConversionRequest
+    source=tmp_path/'source'; source.mkdir(); (source/'package.json').write_text('{}')
+    root=tmp_path/'output'
+    with pytest.raises(ValueError,match='缺少工程依赖'):
+        ConversionJobs(root).start(ConversionRequest(source_dir=str(source)))
+    assert not root.exists()
+    with pytest.raises(ValueError,match='输出目录不能'):
+        ConversionJobs(source/'output').start(ConversionRequest(source_dir=str(source)))
+    assert not (source/'output').exists()
+
+
+def test_desktop_frozen_worker_uses_self_contained_gui_executable(tmp_path, monkeypatch):
+    import sys
+    from server.runtime_jobs import command_for, ConversionRequest
+    monkeypatch.setattr(sys,'frozen',True,raising=False)
+    monkeypatch.setattr(sys,'executable',str(tmp_path/'UAgent.exe'))
+    request=ConversionRequest(source_dir=str(tmp_path/'source'))
+    command=command_for(tmp_path/'source',tmp_path/'output',request)
+    assert command[:2]==[str(tmp_path/'UAgent.exe'),'--convert'] and '--width' in command
+
+
+def test_production_browser_host_works_without_python_interpreter_in_frozen_exe(tmp_path, monkeypatch):
+    import sys
+    import urllib.request
+    from types import SimpleNamespace
+    from tools import runtime_convert as converter
+    source=tmp_path/'source'; source.mkdir()
+    output=tmp_path/'output'; output.mkdir()
+    def build(command, **kwargs):
+        folder=Path(command[command.index('--outDir')+1]);folder.mkdir()
+        (folder/'index.html').write_text('<h1>React host</h1>')
+        (folder/'app.js').write_text('const count=1;')
+        return SimpleNamespace(returncode=0,stdout='built',stderr='')
+    def no_child(*args, **kwargs):
+        raise AssertionError('A frozen EXE must not be invoked with Python -c')
+    monkeypatch.setattr(sys,'frozen',True,raising=False)
+    monkeypatch.setattr(sys,'executable',str(tmp_path/'UAgent.exe'))
+    monkeypatch.setattr(converter.subprocess,'run',build)
+    monkeypatch.setattr(converter.subprocess,'Popen',no_child)
+    server,url,log=converter.serve_production(source,output)
+    try:
+        assert urllib.request.urlopen(url,timeout=2).read()==b'<h1>React host</h1>'
+        script=urllib.request.urlopen(url+'app.js',timeout=2)
+        assert script.headers['Content-Type'].startswith('text/javascript')
+        assert script.read()==b'const count=1;'
+    finally:
+        server.terminate();assert server.wait(timeout=2)==0;log.close()
+    assert not server.thread.is_alive()
